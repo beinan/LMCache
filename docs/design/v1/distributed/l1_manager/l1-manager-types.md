@@ -100,46 +100,34 @@ never re-runs the policy; see [../storage_manager.md](../storage_manager.md).
 
 ## Shadow L1
 
-The read path (lookup, read locks, `finish_read`, eviction, events) only
-serves objects an L1 manager indexes, so data an L2 adapter can lend instead
-of copying -- bytes a peer owns that this host's GPU can read directly -- needs
-an L1 that indexes them without owning them. `ShadowL1Manager` is that L1:
+Lookup, read locks, `finish_read` and eviction only serve objects an L1
+indexes. An L2 adapter that lends a peer's bytes instead of copying them needs
+an L1 that indexes those bytes without owning them. `ShadowL1Manager` is that
+L1:
 
 ```text
-L2 adapter that lends views                 ShadowL1Manager (metadata only)
-  take_borrowed_objects(task, keys) ──────►   admit({key: view}, read_locks)
-  -> BorrowedTensorMemoryObj per key           resident + read-locked, 0 bytes
-       is_valid(): lease still holds            ...ordinary readers...
-       release():  end lease  ◄──────────────  free (last finish_read, delete,
-                                                eviction, release_all)
+lending L2 adapter                         ShadowL1Manager (metadata only)
+  take_borrowed_objects(task, keys) ────►  admit({key: view}, read_locks)
+  -> BorrowedTensorMemoryObj per key        resident + read-locked, 0 bytes
+       is_valid(): lease still holds        ...ordinary readers...
+       release():  end lease  ◄──────────── free (last finish_read, delete,
+                                             eviction, release_all)
 ```
 
-- **No payload.** `ShadowL1MemoryManager` refuses `allocate`, reports
-  `(0, 0)` usage and no `L1MemoryDesc`; `free(obj)` calls `obj.release()`.
-  Write placement never targets a shadow L1 (`StorageManager` hands the write
-  policy only the other managers).
-- **Admission.** `admit` replaces `reserve_write` + `finish_write`: one locked
-  pass makes each view resident (temporary) and read-locked. A view of a key
-  that is already resident is released and the resident one is read-locked; a
-  view whose lease already ended is refused (`KEY_IN_WRONG_STATE`), as is a
-  resident view whose lease ended while readers still hold it
-  (`KEY_NOT_READABLE`).
-- **Expiry.** A lease can end on its own (e.g. a peer's reservation TTL).
-  `BaseL1Manager` treats an object whose `is_valid()` is False as unreadable
-  in `reserve_read` and `unsafe_read`, the only lease-related rule in the base
-  class. A reader that already holds an expired view keeps it until its
-  `finish_read`, so a copy in flight is never torn down; `reap_expired()`
-  releases expired views no reader holds.
-- **Tags.** `ShadowL1Manager.next_to(local)` pairs the shadow with a local L1
-  and reports that L1's backend and segment with `REMOTE` residency, so an
-  adapter binds to it through `get_wanted_l1_memory_tags()` and P2P serving
-  (which resolves a `LOCAL` L1) never re-exports a borrowed view.
-- **Who borrows.** The prefetch controller borrows exactly when an L2
-  adapter's L1 affinity is a shadow L1: it calls `take_borrowed_objects` and
-  `admit` instead of reserving L1 buffers and planning a copy load.
-
-The first lender is the shared-pool CXL peer adapter (a follow-up), paired
-with the Device-DAX L1 that maps the pool.
+- **No payload.** Its memory manager refuses `allocate`, and the write policy
+  never places writes on it.
+- **Admission.** `admit` makes each view resident and read-locked in one
+  pass. If the key is already resident, the new view is released and the
+  resident object is locked; a view whose lease already ended is refused.
+- **Expiry.** `BaseL1Manager` treats an object whose `is_valid()` is False as
+  unreadable. A reader already holding it keeps it until `finish_read`, so a
+  copy in flight is never torn down; `reap_expired()` frees the rest.
+- **Tags.** `ShadowL1Manager.next_to(local)` reports the local L1's segment
+  with `REMOTE` residency. Lending adapters bind to it through L1 affinity,
+  and P2P serving, which resolves a `LOCAL` L1, never re-exports a borrowed
+  view.
+- **Who borrows.** The prefetch controller borrows when an adapter's L1
+  affinity is a shadow L1, instead of reserving L1 buffers for a copy.
 
 ## Addressing one L1
 

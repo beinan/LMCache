@@ -96,10 +96,8 @@ L1 managers that own payload are `LOCAL`. The segment names the primary pool:
 | `GDS` slab | `(GDS, LOCAL)` |
 | shadow (paired with a local L1) | the paired L1's segment, `REMOTE` |
 
-A shadow L1 (`ShadowL1Manager`) holds only borrowed views of bytes a peer
-owns, so it is `REMOTE`. That tag binds lending adapters to it through L1
-affinity, and keeps it out of P2P serving, which resolves a `LOCAL` L1: a
-node never re-exports a view it borrowed.
+A shadow L1 holds only views of a peer's bytes, so it is `REMOTE`; see
+[l1_manager/l1-manager-types.md](l1_manager/l1-manager-types.md).
 
 ### L2 own tags
 
