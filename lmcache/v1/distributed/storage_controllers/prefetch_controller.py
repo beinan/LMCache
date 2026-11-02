@@ -1560,9 +1560,20 @@ class PrefetchController(StorageControllerInterface):
             l2_idx: The index of an attached L2 adapter.
 
         Returns:
-            ``True`` if the adapter is not draining and its memory tags are
-            allowed by the request.
+            ``True`` if the adapter is not draining, its memory tags are
+            allowed by the request, and it does not lend views to a
+            ``NO_LOCK`` request.
+
+        Note:
+            An adapter whose L1 affinity is a shadow L1 lends views, which
+            live only while read-locked. A ``NO_LOCK`` (warm) prefetch keeps
+            nothing locked, so such an adapter serves only ``LOCK`` requests.
         """
+        if request.lock_mode == PrefetchLockMode.NO_LOCK and isinstance(
+            self._l1_managers[self._get_l2_affinity_manager(l2_idx)],
+            ShadowL1Manager,
+        ):
+            return False
         return l2_idx not in self._draining and _tags_allowed(
             self._l2_adapters[l2_idx].get_memory_tags(),
             request.allowed_l2_memory_tags,

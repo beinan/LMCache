@@ -2001,6 +2001,13 @@ class LendingMockL2Adapter(MockL2Adapter):
     def __init__(self, config: MockL2AdapterConfig) -> None:
         super().__init__(config)
         self._lent: dict[L2TaskId, set[ObjectKey]] = {}
+        self.lookup_count = 0
+
+    def submit_lookup_and_lock_task(
+        self, keys: list[ObjectKey], group_layout_descs: dict[int, MemoryLayoutDesc]
+    ) -> L2TaskId:
+        self.lookup_count += 1
+        return super().submit_lookup_and_lock_task(keys, group_layout_descs)
 
     def take_borrowed_objects(
         self,
@@ -2077,6 +2084,51 @@ class TestBorrowing:
             assert all(reads[key][0] == L1Error.SUCCESS for key in keys)
             assert adapter.debug_get_locked_key_count() == len(keys)
             shadow.finish_read(keys)
+            assert_l2_unlocked(adapter)
+        finally:
+            ctrl.stop()
+            adapter.close()
+            shadow.close()
+
+    def test_warm_prefetch_skips_lending_adapter(self, l1_manager):
+        """A NO_LOCK prefetch never looks up a lending adapter: a borrowed
+        view cannot outlive its read locks, so it would be a false hit."""
+        shadow = ShadowL1Manager.next_to(l1_manager)
+        adapter = LendingMockL2Adapter(
+            LendingMockL2AdapterConfig(max_size_gb=0.01, mock_bandwidth_gb=10.0)
+        )
+        layout = make_layout()
+        keys = [make_object_key(i) for i in range(3)]
+        store_keys_in_l2(adapter, keys, layout)
+        ctrl = PrefetchController(
+            l1_managers=[l1_manager, shadow],
+            l1_manager_descriptors=[
+                L1ManagerDescriptor(index=m.l1_manager_id, config=m.config)
+                for m in (l1_manager, shadow)
+            ],
+            l2_adapters=[adapter],
+            adapter_descriptors=[
+                L2AdapterDescriptor(
+                    index=0,
+                    config=LendingMockL2AdapterConfig(
+                        max_size_gb=0.01, mock_bandwidth_gb=10.0
+                    ),
+                )
+            ],
+            policy=DefaultPrefetchPolicy(),
+        )
+        ctrl.start()
+        try:
+            result = wait_for_result(
+                ctrl,
+                ctrl.submit_prefetch_request(
+                    single_row_spec(keys, lock_mode=PrefetchLockMode.NO_LOCK)
+                ),
+            )
+            assert row_bits(result) == []
+            assert adapter.lookup_count == 0
+            assert_absent(l1_manager, keys)
+            assert_absent(shadow, keys)  # type: ignore[arg-type]
             assert_l2_unlocked(adapter)
         finally:
             ctrl.stop()

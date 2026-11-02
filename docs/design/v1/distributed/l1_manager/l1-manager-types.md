@@ -127,7 +127,10 @@ lending L2 adapter                         ShadowL1Manager (metadata only)
   and P2P serving, which resolves a `LOCAL` L1, never re-exports a borrowed
   view.
 - **Who borrows.** The prefetch controller borrows when an adapter's L1
-  affinity is a shadow L1, instead of reserving L1 buffers for a copy.
+  affinity is a shadow L1, instead of reserving L1 buffers for a copy. Only
+  `LOCK` prefetches, whose reader is known to need the KV, borrow; a warm
+  (`NO_LOCK`) prefetch keeps nothing locked, so a borrowed view would be freed
+  at once, and such an adapter is not eligible for it.
 
 ## Addressing one L1
 
