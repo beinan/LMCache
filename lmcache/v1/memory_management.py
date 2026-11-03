@@ -947,7 +947,8 @@ class BorrowedTensorMemoryObj(TensorMemoryObj):
         metadata: Layout of the object.
         lease_is_valid: Nonblocking check that the lease still holds.
         on_release: Ends the lease; idempotent, nonblocking, and takes no lock
-            the caller might hold.
+            the caller might hold. It runs under the L1 manager's lock, so it
+            must never call back into an L1 manager.
     """
 
     def __init__(

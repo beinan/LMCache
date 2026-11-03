@@ -11,11 +11,16 @@ the loop applies the op at the top of its next iteration.
 
 # Standard
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 import threading
 
 # First Party
 from lmcache.v1.distributed.l2_adapters.base import L2AdapterInterface
 from lmcache.v1.distributed.storage_controllers.utils import L2AdapterDescriptor
+
+if TYPE_CHECKING:
+    # First Party
+    from lmcache.v1.distributed.l1_manager import ShadowL1Manager
 
 
 @dataclass
@@ -30,6 +35,8 @@ class AddAdapterOp:
     adapter: L2AdapterInterface
     descriptor: L2AdapterDescriptor
     done: threading.Event
+    # The shadow L1 a lending adapter brings; None for an adapter that copies.
+    shadow_l1: "ShadowL1Manager | None" = None
 
 
 @dataclass

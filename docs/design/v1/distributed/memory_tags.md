@@ -94,7 +94,7 @@ L1 managers that own payload are `LOCAL`. The segment names the primary pool:
 | `DRAM` | `(DRAM, LOCAL)` |
 | `DEVDAX` (pure Device-DAX) | `(CXL, LOCAL)` |
 | `GDS` slab | `(GDS, LOCAL)` |
-| shadow (paired with a local L1) | the paired L1's segment, `REMOTE` |
+| shadow (brought by a lending L2 adapter) | the borrowed segment, `REMOTE` |
 
 A shadow L1 holds only views of a peer's bytes, so it is `REMOTE`; see
 [l1_manager/l1-manager-types.md](l1_manager/l1-manager-types.md).

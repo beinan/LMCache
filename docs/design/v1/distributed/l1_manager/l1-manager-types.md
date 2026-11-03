@@ -12,7 +12,7 @@ they share is in [staging-and-write-tags.md](staging-and-write-tags.md).
 | `dram.py` | `DramL1Manager` | pinned host DRAM (`L1MemoryManager`) | `DRAM` | `(DRAM, LOCAL)` |
 | `devdax.py` | `DevDaxL1Manager` | Device-DAX arenas (`DevDaxL1MemoryManager`) | `DEVDAX` | `(CXL, LOCAL)` |
 | `gds.py` | `GdsL1Manager` | NVMe slab via GPUDirect Storage (`GDSL1MemoryManager`) | `GDS` | `(GDS, LOCAL)` |
-| `shadow.py` | `ShadowL1Manager` | none: borrowed views of a peer's bytes (`ShadowL1MemoryManager`) | the paired L1's | the paired L1's segment, `REMOTE` |
+| `shadow.py` | `ShadowL1Manager` | none: borrowed views of a peer's bytes (`ShadowL1MemoryManager`) | the borrowed segment's | the borrowed segment, `REMOTE` |
 | `factory.py` | `create_l1_manager`, `create_l1_managers` | picks the subclass from `L1ManagerConfig` | | |
 
 ## One medium per manager
@@ -72,7 +72,8 @@ list in placement order, refuses a Device-DAX config whose range an earlier
 so device aliases resolve the way the allocator sees them), and closes the
 already-created managers on any failure. `StorageManager.__init__` is the
 only production caller; tests build single managers with
-`create_l1_manager(config)`.
+`create_l1_manager(config)`. Shadow L1s are not configured: a lending L2
+adapter brings one (see below).
 
 ## Write placement
 
@@ -100,10 +101,9 @@ never re-runs the policy; see [../storage_manager.md](../storage_manager.md).
 
 ## Shadow L1
 
-Lookup, read locks, `finish_read` and eviction only serve objects an L1
-indexes. An L2 adapter that lends a peer's bytes instead of copying them needs
-an L1 that indexes those bytes without owning them. `ShadowL1Manager` is that
-L1:
+Lookup, read locks and `finish_read` only serve objects an L1 indexes. An L2
+adapter that lends a peer's bytes instead of copying them needs an L1 that
+indexes those bytes without owning them. `ShadowL1Manager` is that L1:
 
 ```text
 lending L2 adapter                         ShadowL1Manager (metadata only)
@@ -111,26 +111,51 @@ lending L2 adapter                         ShadowL1Manager (metadata only)
   -> BorrowedTensorMemoryObj per key        resident + read-locked, 0 bytes
        is_valid(): lease still holds        ...ordinary readers...
        release():  end lease  ◄──────────── free (last finish_read, delete,
-                                             eviction, release_all)
+                                             reap_expired, release_all)
 ```
 
+- **Brought by its lender.** The adapter resolves and maps the peers' memory
+  itself, like the P2P workflow, so nothing about the borrowed bytes is known
+  at configuration time and the shadow needs no size or device. An adapter
+  that wants a `REMOTE` L1 first (`borrowed_segment(config)`) is a lender:
+  `StorageManager._build_l2_adapter` creates
+  `ShadowL1Manager.for_lender(adapter_id, segment, defaults)` for it, tagged
+  `shadow.<segment>.<adapter_id>`, with the default L1's lock TTLs, and
+  attaches it to the L1 set; the prefetch controller takes the shadow as that
+  adapter's L1 affinity. When the adapter is deleted, the controller detaches
+  it only once its views drained, and the storage manager then closes the
+  shadow. One lender, one shadow: a DRAM lender and a CXL lender each bring
+  their own, and no local L1 of that medium is needed.
 - **No payload.** Its memory manager refuses `allocate`, and the write policy
-  never places writes on it.
+  never places writes on it. It has no store controller.
+- **No eviction.** `StorageManager` starts no eviction controller for it.
+  Eviction reclaims memory an L1 owns; a shadow indexes a peer's bytes, which
+  the peer evicts. This holds even for a shadow that accepts writes (a memory
+  manager whose `allocate` reserves a slot in the peer's L1): views leave when
+  their last reader finishes or `reap_expired()` collects them.
 - **Admission.** `admit` makes each view resident and read-locked in one
   pass. If the key is already resident, the new view is released and the
-  resident object is locked; a view whose lease already ended is refused.
+  resident object is locked; a view whose lease already ended is refused. A
+  resident view whose lease ended and that no reader holds is replaced.
 - **Expiry.** `BaseL1Manager` treats an object whose `is_valid()` is False as
   unreadable. A reader already holding it keeps it until `finish_read`, so a
-  copy in flight is never torn down; `reap_expired()` frees the rest.
-- **Tags.** `ShadowL1Manager.next_to(local)` reports the local L1's segment
-  with `REMOTE` residency. Lending adapters bind to it through L1 affinity,
-  and P2P serving, which resolves a `LOCAL` L1, never re-exports a borrowed
-  view.
-- **Who borrows.** The prefetch controller borrows when an adapter's L1
-  affinity is a shadow L1, instead of reserving L1 buffers for a copy. Only
-  `LOCK` prefetches, whose reader is known to need the KV, borrow; a warm
+  copy in flight is never torn down. `reap_expired()`, run by the prefetch
+  loop at most once per poll timeout, frees every view no reader holds: one
+  whose last `finish_read` already ran, or whose read-lock TTL lapsed, since a
+  late `finish_read` is refused and would never free it. The lease state does
+  not matter for reaping; a reader past its TTL is treated as gone, as in
+  every L1.
+- **Tags.** The shadow reports the borrowed segment with `REMOTE` residency.
+  P2P serving, which resolves a `LOCAL` L1, never re-exports a borrowed view.
+- **Who borrows.** The prefetch controller borrows when an adapter brought a
+  shadow L1, instead of reserving L1 buffers for a copy. Only `LOCK`
+  prefetches, whose reader is known to need the KV, borrow; a warm
   (`NO_LOCK`) prefetch keeps nothing locked, so a borrowed view would be freed
-  at once, and such an adapter is not eligible for it.
+  at once, and such an adapter is not eligible for it. For the same reason a
+  warm prefetch does not look up a shadow L1 at all: a view it hit would be
+  freed, under its other readers, once the warm request's lock turned out to
+  be the last one (a lock taken after the holders' TTL lapsed resets the
+  count to one).
 
 ## Addressing one L1
 

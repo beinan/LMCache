@@ -23,6 +23,7 @@ import enum
 import itertools
 import select
 import threading
+import time
 
 # First Party
 from lmcache.lmcache_native import Bitmap
@@ -59,6 +60,7 @@ from lmcache.v1.distributed.storage_controllers.utils import (
     L1ManagerDescriptor,
     L2AdapterDescriptor,
     MapState,
+    borrowed_segment,
     resolve_l1_affinity,
 )
 from lmcache.v1.mp_observability.event import Event, EventType
@@ -520,7 +522,25 @@ class PrefetchController(StorageControllerInterface):
         adapter_descriptors: list[L2AdapterDescriptor],
         policy: PrefetchPolicy,
         inflight_watermark: float = 0.5,
+        shadow_l1s: dict[int, ShadowL1Manager] | None = None,
     ) -> None:
+        """Create the controller over the L1 managers and L2 adapters.
+
+        Args:
+            l1_managers: The L1 managers that own memory, in placement order.
+            l1_manager_descriptors: One descriptor per L1 manager.
+            l2_adapters: The initial L2 adapters.
+            adapter_descriptors: One descriptor per adapter.
+            policy: The prefetch policy.
+            inflight_watermark: Fraction of L1 the in-flight loads may hold.
+            shadow_l1s: The shadow L1 each lending adapter brings, by adapter
+                id. A lending adapter's L1 affinity is its shadow; every
+                other adapter's is resolved from its wanted memory tags.
+
+        Raises:
+            ValueError: If a lending adapter has no shadow L1, or a copying
+                adapter wants memory tags no L1 manager has.
+        """
         self._l1_managers: dict[int, L1ManagerInterface] = {
             desc.index: mgr
             for desc, mgr in zip(l1_manager_descriptors, l1_managers, strict=True)
@@ -528,6 +548,9 @@ class PrefetchController(StorageControllerInterface):
         self._l1_manager_descriptors: dict[int, L1ManagerDescriptor] = {
             desc.index: desc for desc in l1_manager_descriptors
         }
+        # Lending adapter id -> its shadow L1, and the shadows' L1 ids.
+        self._shadow_l1s: dict[int, ShadowL1Manager] = {}
+        self._shadow_l1_ids: set[int] = set()
 
         self._l2_adapters: dict[int, L2AdapterInterface] = {
             desc.index: adapter
@@ -537,10 +560,15 @@ class PrefetchController(StorageControllerInterface):
             desc.index: desc for desc in adapter_descriptors
         }
         self._policy = policy
-        self._l2_affinity = {
-            d.index: resolve_l1_affinity(d.config, self._l1_managers)
-            for d in adapter_descriptors
-        }
+        self._l2_affinity: dict[int, int] = {}
+        for d in adapter_descriptors:
+            shadow = (shadow_l1s or {}).get(d.index)
+            if shadow is None:
+                self._l2_affinity[d.index] = self._resolve_affinity(d)
+            else:
+                self._attach_shadow(d.index, shadow)
+        # Rate-limits the shadow reaper to once per poll timeout.
+        self._last_reap = 0.0
 
         self._inflight_watermark = inflight_watermark
 
@@ -830,6 +858,7 @@ class PrefetchController(StorageControllerInterface):
         adapter_id: int,
         adapter: L2AdapterInterface,
         descriptor: L2AdapterDescriptor,
+        shadow_l1: ShadowL1Manager | None = None,
     ) -> None:
         """Blocking function to add a new adapter into the prefetch
         controller with the specified adapter ID and descriptor.
@@ -839,20 +868,24 @@ class PrefetchController(StorageControllerInterface):
             adapter: The adapter instance to attach.
             descriptor: The adapter's descriptor (``descriptor.index`` must
                 equal ``adapter_id``).
+            shadow_l1: The shadow L1 a lending adapter brings; it becomes the
+                adapter's L1 affinity and is detached with the adapter.
 
         Raises:
-            ValueError: If no L1 manager has the memory tags the adapter
-                wants.
+            ValueError: If a lending adapter comes without a shadow L1, or no
+                L1 manager has the memory tags a copying adapter wants.
             RuntimeError: If the background loop did not apply the op in
                 time (e.g. the loop is not running).
         """
         # Raise on the caller's thread rather than in the loop thread.
-        resolve_l1_affinity(descriptor.config, self._l1_managers)
+        if shadow_l1 is None:
+            self._resolve_affinity(descriptor)
         op = AddAdapterOp(
             adapter_id=adapter_id,
             adapter=adapter,
             descriptor=descriptor,
             done=threading.Event(),
+            shadow_l1=shadow_l1,
         )
         with self._adapter_ops_lock:
             self._pending_adapter_ops.append(op)
@@ -904,9 +937,7 @@ class PrefetchController(StorageControllerInterface):
             poller.register(efd, select.POLLIN)
 
         while not self._stop_flag.is_set():
-            for manager in self._l1_managers.values():
-                if isinstance(manager, ShadowL1Manager):
-                    manager.reap_expired()
+            self._reap_shadows()
             # First, apply runtime add/remove of the L2 adapters.
             self._apply_pending_adapter_ops(poller)
 
@@ -999,9 +1030,12 @@ class PrefetchController(StorageControllerInterface):
             self._pending_adapter_ops = []
         for op in ops:
             if isinstance(op, AddAdapterOp):
-                self._l2_affinity[op.adapter_id] = resolve_l1_affinity(
-                    op.descriptor.config, self._l1_managers
-                )
+                if op.shadow_l1 is None:
+                    self._l2_affinity[op.adapter_id] = self._resolve_affinity(
+                        op.descriptor
+                    )
+                else:
+                    self._attach_shadow(op.adapter_id, op.shadow_l1)
                 self._l2_adapters[op.adapter_id] = op.adapter
                 self._adapter_descriptors[op.adapter_id] = op.descriptor
                 lookup_efd = op.adapter.get_lookup_and_lock_event_fd()
@@ -1054,6 +1088,7 @@ class PrefetchController(StorageControllerInterface):
             adapter = self._l2_adapters.pop(adapter_id)
             self._adapter_descriptors.pop(adapter_id, None)
             self._l2_affinity.pop(adapter_id, None)
+            self._detach_shadow(adapter_id)
             lookup_efd = adapter.get_lookup_and_lock_event_fd()
             load_efd = adapter.get_load_event_fd()
             self._lookup_efd_to_adapter.pop(lookup_efd, None)
@@ -1205,7 +1240,11 @@ class PrefetchController(StorageControllerInterface):
 
         Note:
             Locks are taken regardless of the lock mode; under ``NO_LOCK``
-            they are released when the request finishes.
+            they are released when the request finishes. A shadow L1 is
+            skipped under ``NO_LOCK``: its views live only while read-locked,
+            so a warm hit there pins nothing and, if the warm request's lock
+            is the last one, releasing it frees the view under its other
+            readers.
         """
         flattened_keys = request.get_flattened_keys()
         num_rows = len(request.key_groups)
@@ -1215,6 +1254,11 @@ class PrefetchController(StorageControllerInterface):
             for l1_idx, l1_manager in self._l1_managers.items():
                 if not _tags_allowed(
                     l1_manager.get_memory_tags(), request.allowed_l1_memory_tags
+                ):
+                    continue
+                if (
+                    request.lock_mode == PrefetchLockMode.NO_LOCK
+                    and l1_idx in self._shadow_l1_ids
                 ):
                     continue
                 result = l1_manager.reserve_read(flattened_keys, request.num_kv_readers)
@@ -1351,17 +1395,18 @@ class PrefetchController(StorageControllerInterface):
             group.object_group_id: group.layout_desc for group in request.key_groups
         }
         for adapter_idx, cells in list(states.l2_locked_keys.items()):
-            l1_idx = self._get_l2_affinity_manager(adapter_idx)
-            manager = self._l1_managers[l1_idx]
-            if not isinstance(manager, ShadowL1Manager):
+            manager = self._shadow_l1s.get(adapter_idx)
+            if manager is None:
                 continue
+            l1_idx = manager.l1_manager_id
             adapter = self._l2_adapters[adapter_idx]
             keys = _gather_keys(request.key_groups, cells)
             task_id = request.lookup_task_ids[adapter_idx]
             admitted = Bitmap(len(keys))
             try:
-                # A view not admitted is released by admit (or, if admit
-                # never runs, by its lender when it is garbage-collected).
+                # A view not admitted is released by admit. A lender never
+                # raises once it has created a view (see
+                # take_borrowed_objects), so admit always runs on every view.
                 results = manager.admit(
                     adapter.take_borrowed_objects(task_id, keys, layouts),
                     read_locks=request.num_kv_readers,
@@ -1569,10 +1614,7 @@ class PrefetchController(StorageControllerInterface):
             live only while read-locked. A ``NO_LOCK`` (warm) prefetch keeps
             nothing locked, so such an adapter serves only ``LOCK`` requests.
         """
-        if request.lock_mode == PrefetchLockMode.NO_LOCK and isinstance(
-            self._l1_managers[self._get_l2_affinity_manager(l2_idx)],
-            ShadowL1Manager,
-        ):
+        if request.lock_mode == PrefetchLockMode.NO_LOCK and l2_idx in self._shadow_l1s:
             return False
         return l2_idx not in self._draining and _tags_allowed(
             self._l2_adapters[l2_idx].get_memory_tags(),
@@ -1590,6 +1632,55 @@ class PrefetchController(StorageControllerInterface):
             index.
         """
         return self._l2_affinity[l2_adapter_idx]
+
+    def _resolve_affinity(self, descriptor: L2AdapterDescriptor) -> int:
+        """Resolve a copying adapter's L1 affinity from its wanted tags.
+
+        Raises:
+            ValueError: If the adapter lends views (it must bring a shadow
+                L1) or no L1 manager has the memory tags it wants.
+        """
+        segment = borrowed_segment(descriptor.config)
+        if segment is not None:
+            raise ValueError(
+                f"L2 adapter {descriptor.index} lends {segment.value} views "
+                "and must be added with its shadow L1"
+            )
+        return resolve_l1_affinity(descriptor.config, self._l1_managers)
+
+    def _attach_shadow(self, adapter_id: int, shadow: ShadowL1Manager) -> None:
+        """Register a lending adapter's shadow L1 as its L1 affinity."""
+        l1_id = shadow.l1_manager_id
+        self._l1_managers[l1_id] = shadow
+        self._l1_manager_descriptors[l1_id] = L1ManagerDescriptor(
+            index=l1_id, config=shadow.config
+        )
+        self._shadow_l1s[adapter_id] = shadow
+        self._shadow_l1_ids.add(l1_id)
+        self._l2_affinity[adapter_id] = l1_id
+
+    def _detach_shadow(self, adapter_id: int) -> None:
+        """Forget a detached lending adapter's shadow L1, if it had one."""
+        shadow = self._shadow_l1s.pop(adapter_id, None)
+        if shadow is None:
+            return
+        l1_id = shadow.l1_manager_id
+        self._shadow_l1_ids.discard(l1_id)
+        del self._l1_managers[l1_id]
+        del self._l1_manager_descriptors[l1_id]
+
+    def _reap_shadows(self) -> None:
+        """Collect unheld views, at most once per poll timeout.
+
+        Each pass scans every shadow under its lock, so a busy loop must not
+        reap on every iteration.
+        """
+        now = time.monotonic()
+        if now - self._last_reap < PREFETCH_LOOP_POLL_TIMEOUT_MS / 1000:
+            return
+        self._last_reap = now
+        for shadow in self._shadow_l1s.values():
+            shadow.reap_expired()
 
     def _poll_load_results(
         self,

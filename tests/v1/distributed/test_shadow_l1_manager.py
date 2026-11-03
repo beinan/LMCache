@@ -3,6 +3,7 @@
 
 # Standard
 from collections.abc import Iterator
+import time
 
 # Third Party
 import pytest
@@ -92,7 +93,7 @@ def shadow(fake_pinned_memory: None) -> Iterator[ShadowL1Manager]:
             read_ttl_seconds=300,
         )
     )
-    manager = ShadowL1Manager.next_to(local)
+    manager = ShadowL1Manager.for_lender(0, MemorySegment.DRAM, local.config)
     yield manager
     manager.close()
     local.close()
@@ -104,7 +105,7 @@ def test_shadow_mirrors_its_local_medium_as_remote(shadow: ShadowL1Manager) -> N
     assert shadow.get_memory_tags() == MemoryTags(
         MemorySegment.DRAM, MemoryResidency.REMOTE
     )
-    assert shadow.config.tag == "_default.shadow"
+    assert shadow.config.tag == "shadow.dram.0"
     assert shadow.get_capacity_bytes() == 0
     assert shadow.get_memory_usage() == (0, 0)
     assert shadow.get_l1_memory_desc() is None
@@ -188,3 +189,60 @@ def test_shadow_memory_manager_never_allocates() -> None:
     lease = Lease()
     assert manager.free([_view(lease)]) == L1Error.SUCCESS
     assert lease.releases == 1
+
+
+def test_for_lender_rejects_a_segment_no_l1_backs(shadow: ShadowL1Manager) -> None:
+    with pytest.raises(ValueError, match="vram"):
+        ShadowL1Manager.for_lender(1, MemorySegment.VRAM, shadow.config)
+
+
+def test_reaper_collects_a_view_whose_read_ttl_lapsed(
+    fake_pinned_memory: None,
+) -> None:
+    """A reader past its TTL is gone: its late finish_read is refused, so the
+    reaper must free the view whatever the lease says, or the lender's
+    reservation stays pinned."""
+    local = DramL1Manager(
+        L1ManagerConfig(
+            L1MemoryManagerConfig(size_in_bytes=PAGE, use_lazy=False, shm_name=""),
+            read_ttl_seconds=1,
+        )
+    )
+    shadow = ShadowL1Manager.for_lender(0, MemorySegment.DRAM, local.config)
+    try:
+        lease = Lease()
+        shadow.admit({KEY: _view(lease)})
+        time.sleep(1.2)
+        assert shadow.finish_read([KEY])[KEY] == L1Error.KEY_IN_WRONG_STATE
+        assert lease.releases == 0
+        shadow.reap_expired()
+        assert lease.releases == 1
+        assert shadow.unsafe_read([KEY])[KEY][0] == L1Error.KEY_NOT_EXIST
+    finally:
+        shadow.close()
+        local.close()
+
+
+def test_admit_replaces_a_stale_unheld_view(fake_pinned_memory: None) -> None:
+    """An expired view nobody holds must not refuse a fresh one for its key."""
+    local = DramL1Manager(
+        L1ManagerConfig(
+            L1MemoryManagerConfig(size_in_bytes=PAGE, use_lazy=False, shm_name=""),
+            read_ttl_seconds=1,
+        )
+    )
+    shadow = ShadowL1Manager.for_lender(0, MemorySegment.DRAM, local.config)
+    try:
+        stale = Lease()
+        shadow.admit({KEY: _view(stale)})
+        stale.valid = False
+        time.sleep(1.2)  # the holder's TTL lapses: stale and unheld
+        fresh = Lease()
+        view = _view(fresh)
+        assert shadow.admit({KEY: view})[KEY] == (L1Error.SUCCESS, view)
+        assert stale.releases == 1
+        assert fresh.releases == 0
+        assert shadow.unsafe_read([KEY])[KEY] == (L1Error.SUCCESS, view)
+    finally:
+        shadow.close()
+        local.close()

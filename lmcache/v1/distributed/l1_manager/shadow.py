@@ -11,6 +11,7 @@ from lmcache.lmcache_native import TTLLock
 from lmcache.v1.distributed.api import (
     L1BackendType,
     MemoryResidency,
+    MemorySegment,
     MemoryTags,
     ObjectKey,
 )
@@ -27,66 +28,97 @@ from lmcache.v1.distributed.memory_manager import ShadowL1MemoryManager
 from lmcache.v1.memory_management import BorrowedTensorMemoryObj, MemoryObj
 from lmcache.v1.mp_observability.event import Event, EventType
 
+# The L1 medium a borrowed segment is reported as: a peer's DRAM view counts
+# as DRAM, a peer's CXL view as Device-DAX. Segments no L1 backs cannot be
+# borrowed.
+_BACKEND_BY_SEGMENT: dict[MemorySegment, L1BackendType] = {
+    MemorySegment.DRAM: L1BackendType.DRAM,
+    MemorySegment.CXL: L1BackendType.DEVDAX,
+    MemorySegment.GDS: L1BackendType.GDS,
+}
+
 
 class ShadowL1Manager(BaseL1Manager):
     """L1 manager whose objects are borrowed views: metadata only, no payload.
 
     An L2 adapter that lends views (e.g. of a peer's memory) produces
     :class:`BorrowedTensorMemoryObj` objects; this manager indexes them by key
-    so the ordinary read path (read locks, ``finish_read``, eviction, events)
-    serves them. Freeing an object ends its lease instead of returning memory,
-    and the manager has no capacity, so write placement never targets it.
+    so the ordinary read path (read locks, ``finish_read``, events) serves
+    them. Freeing an object ends its lease instead of returning memory. The
+    manager has no capacity, so write placement never targets it, and it runs
+    no eviction controller: the peer that owns the bytes evicts them, and
+    views leave here when their last reader finishes or
+    :meth:`reap_expired` collects them.
 
     A view whose lease ended is never handed to a new reader. A reader that
     already holds it keeps it until its last ``finish_read`` (views are
     temporary), so a copy in flight is never torn down.
     """
 
-    def __init__(self, config: L1ManagerConfig, local: BaseL1Manager) -> None:
-        """Create the shadow L1 that borrows peers' copies of ``local``'s medium.
+    def __init__(
+        self,
+        config: L1ManagerConfig,
+        segment: MemorySegment,
+        backend_type: L1BackendType,
+    ) -> None:
+        """Create a shadow L1 for views of one memory segment.
 
         Args:
             config: Lifetime and reporting settings for the shadow L1.
-            local: The local L1 whose medium the borrowed bytes share; this
-                L1 reports the same backend and memory segment, as REMOTE.
+            segment: The segment the borrowed bytes live in, reported as
+                REMOTE.
+            backend_type: The L1 medium the views are reported as.
         """
-        self._backend_type = local.backend_type
+        self._backend_type = backend_type
         self._memory_tags = MemoryTags(
-            segment=local.get_memory_tags().segment,
-            residency=MemoryResidency.REMOTE,
+            segment=segment, residency=MemoryResidency.REMOTE
         )
         super().__init__(config, ShadowL1MemoryManager())
 
     @classmethod
-    def next_to(cls, local: BaseL1Manager) -> "ShadowL1Manager":
-        """Create the shadow L1 paired with ``local``.
+    def for_lender(
+        cls, adapter_id: int, segment: MemorySegment, defaults: L1ManagerConfig
+    ) -> "ShadowL1Manager":
+        """Create the shadow L1 a lending L2 adapter brings with it.
 
-        It inherits ``local``'s lock TTLs and eviction settings, is tagged
-        ``<local tag>.shadow``, and has no memory of its own.
+        The adapter resolves and maps the peers' memory, like the P2P
+        workflow; nothing about the borrowed bytes is known in advance, so
+        the shadow needs no size or device. It takes the lock TTLs from
+        ``defaults``, is tagged ``shadow.<segment>.<adapter_id>``, and has no
+        memory of its own.
 
         Args:
-            local: The local L1 whose peers' copies are borrowed.
+            adapter_id: Stable id of the lending adapter; makes the tag unique.
+            segment: The segment the adapter borrows (its wanted L1 tags).
+            defaults: The L1 settings the shadow inherits TTLs from.
 
         Returns:
             A new, open shadow L1 manager.
+
+        Raises:
+            ValueError: If no L1 medium backs ``segment``.
         """
+        backend_type = _BACKEND_BY_SEGMENT.get(segment)
+        if backend_type is None:
+            raise ValueError(f"No L1 medium backs borrowed {segment.value} views")
         config = replace(
-            local.config,
-            tag=f"{local.config.tag}.shadow",
+            defaults,
+            tag=f"shadow.{segment.value}.{adapter_id}",
             memory_config=L1MemoryManagerConfig(
                 size_in_bytes=0, use_lazy=False, shm_name=""
             ),
             gds_l1_config=None,
+            eviction=None,
         )
-        return cls(config, local)
+        return cls(config, segment, backend_type)
 
     @property
     def backend_type(self) -> L1BackendType:
-        """Return the paired local L1's backend."""
+        """Return the L1 medium the borrowed views are reported as."""
         return self._backend_type
 
     def get_memory_tags(self) -> MemoryTags:
-        """Return the paired local L1's segment with REMOTE residency."""
+        """Return the borrowed segment with REMOTE residency."""
         return self._memory_tags
 
     @l1_mgr_synchronized
@@ -98,7 +130,8 @@ class ShadowL1Manager(BaseL1Manager):
         """Make borrowed views resident and read-lock them, without allocating.
 
         The view's ownership passes to this manager: every view not kept
-        resident is released before returning.
+        resident is released before returning. A resident view whose lease
+        ended and that no reader holds is replaced by the given view.
 
         Args:
             objects: Borrowed view per key.
@@ -121,8 +154,20 @@ class ShadowL1Manager(BaseL1Manager):
         admitted_meta: list[L1ObjectMeta] = []
         resident_keys: list[ObjectKey] = []
         discarded: list[MemoryObj] = []
+        replaced_keys: list[ObjectKey] = []
+        replaced: list[MemoryObj] = []
         for key, obj in objects.items():
             entry = self._objects.get(key)
+            if (
+                entry is not None
+                and not entry.memory_obj.is_valid()
+                and not entry.read_lock.is_locked()
+            ):
+                # Stale and unheld: the reaper would collect it; do so now
+                # so the fresh view is not refused behind it.
+                replaced_keys.append(key)
+                replaced.append(self._objects.pop(key).memory_obj)
+                entry = None
             if entry is not None:
                 discarded.append(obj)
                 if not entry.memory_obj.is_valid():
@@ -148,6 +193,8 @@ class ShadowL1Manager(BaseL1Manager):
                 entry.read_lock.lock()
             ret[key] = (L1Error.SUCCESS, entry.memory_obj)
 
+        if replaced_keys:
+            self._free_and_report_deleted(replaced_keys, replaced)
         self._memory_manager.free(discarded)
         if resident_keys:
             self._report_read_reserved(resident_keys)
@@ -167,15 +214,19 @@ class ShadowL1Manager(BaseL1Manager):
 
     @l1_mgr_synchronized
     def reap_expired(self) -> None:
-        """Release views whose lease ended and that no reader holds.
+        """Release every view no reader holds.
 
-        A held, expired view stays (unreadable) until its last
-        ``finish_read`` frees it, or its local read lock's TTL lapses.
+        A view is unheld once its last ``finish_read`` ran (which frees it
+        at once) or its read lock's TTL lapsed, in which case a late
+        ``finish_read`` is refused and would never free it. The lease state
+        does not matter: an unheld view serves nobody, and a reader past its
+        TTL is treated as gone, as in every L1. A held view whose lease ended
+        stays, unreadable to new readers, until its last ``finish_read``.
         """
         expired = [
             key
             for key, entry in self._objects.items()
-            if not entry.read_lock.is_locked() and not entry.memory_obj.is_valid()
+            if not entry.read_lock.is_locked()
         ]
         if expired:
             objs = [self._objects.pop(key).memory_obj for key in expired]
@@ -185,10 +236,12 @@ class ShadowL1Manager(BaseL1Manager):
         """Release every view, read-locked or not, before lenders shut down.
 
         Call after stopping new controller and GPU submissions; outstanding
-        device work is synchronized first so no copy reads a released view.
+        work on every device is synchronized first so no copy reads a
+        released view.
         """
         if torch_dev.is_available():
-            torch_dev.synchronize()
+            for device in range(torch_dev.device_count()):
+                torch_dev.synchronize(device)
         self.clear(force=True)
 
     def _object_meta(self, memory_obj: MemoryObj) -> L1ObjectMeta:

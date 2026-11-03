@@ -176,6 +176,12 @@ class L2AdapterInterface(ABC):
 
         Raises:
             NotImplementedError: If this adapter copies instead of lending.
+
+        Note:
+            A lender must not raise once it has created a view: a key it
+            cannot lend (layout mismatch, reservation expired) is omitted
+            from the result, not reported by an exception. A view that never
+            reaches the caller would only be released by its finalizer.
         """
         raise NotImplementedError(f"{type(self).__name__} does not lend views")
 

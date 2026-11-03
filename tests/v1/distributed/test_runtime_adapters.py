@@ -18,7 +18,13 @@ import torch
 
 # First Party
 from lmcache import torch_dev, torch_device_type
-from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
+from lmcache.v1.distributed.api import (
+    MemoryLayoutDesc,
+    MemoryResidency,
+    MemorySegment,
+    MemoryTags,
+    ObjectKey,
+)
 from lmcache.v1.distributed.config import (
     EvictionConfig,
     L1ManagerConfig,
@@ -28,6 +34,7 @@ from lmcache.v1.distributed.config import (
 from lmcache.v1.distributed.l1_manager import DramL1Manager
 from lmcache.v1.distributed.l2_adapters.config import L2AdaptersConfig
 from lmcache.v1.distributed.l2_adapters.mock_l2_adapter import (
+    LendingMockL2AdapterConfig,
     MockL2Adapter,
     MockL2AdapterConfig,
 )
@@ -446,5 +453,34 @@ class TestStorageManagerRuntimeAdapters:
             assert len(pairs) == 1
             assert pairs[0][0].index == id1
             assert pairs[0][1] is a1
+        finally:
+            sm.close()
+
+    def test_lending_adapter_brings_its_shadow_l1(self, empty_storage_manager_config):
+        """A lending adapter adds a shadow L1 that owns no memory: it appears
+        among the L1s but has no store or eviction controller, and it leaves
+        with the adapter."""
+        sm = StorageManager(empty_storage_manager_config)
+        try:
+            adapter_id = sm.add_l2_adapter(
+                LendingMockL2AdapterConfig(max_size_gb=0.01, mock_bandwidth_gb=10.0)
+            )
+            status = sm.report_status()
+            shadow_tag = f"shadow.dram.{adapter_id}"
+            assert set(status["l1_managers"]) == {"_default", shadow_tag}
+            assert set(status["store_controllers"]) == {"_default"}
+            assert set(status["l1_eviction_controllers"]) == {"_default"}
+            assert status["is_healthy"]
+            assert (
+                sm.get_l1_manager_by_tags(
+                    MemoryTags(MemorySegment.DRAM, MemoryResidency.REMOTE)
+                ).config.tag
+                == shadow_tag
+            )
+
+            sm.delete_l2_adapter(adapter_id)
+            status = sm.report_status()
+            assert set(status["l1_managers"]) == {"_default"}
+            assert status["num_l2_adapters"] == 0
         finally:
             sm.close()
