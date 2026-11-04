@@ -55,15 +55,12 @@ means, while the polling, timeout and failure handling around it stay shared:
 | Strategy | What `_process_lookup_result` does with a hit |
 |---|---|
 | Copy (`P2PL2Adapter`) | records the address; a later load copies the bytes into local L1 |
-| Lend (a follow-up subclass, e.g. GPU-direct or CXL in place) | keeps the reservation and hands L1 a borrowed view; no copy, no local capacity |
+| Lend (`LendingPeerL2AdapterBase`, e.g. GPU-direct or CXL in place) | keeps the reservation and hands L1 a borrowed view; no copy, no local capacity |
 
-The lend strategy has its own abstract base, `LendingPeerL2AdapterBase`,
-which adds `take_borrowed_objects`, `release_lookup` and
-`get_active_borrow_count`. That type is what lets the storage manager give an
-adapter a shadow L1; it wants a `REMOTE` L1 and cannot use serde, since its
-views are read in place. See
-[../l1_manager/l1-manager-types.md](../l1_manager/l1-manager-types.md)
-("Shadow L1").
+`LendingPeerL2AdapterBase` is abstract and adds `take_borrowed_objects`,
+`release_lookup` and `get_active_borrow_count`. Being that type is what earns
+an adapter a shadow L1 (`../l1_manager/l1-manager-types.md`, "Shadow L1"). It
+cannot use serde: its views are read in place.
 
 ## Lifecycle
 

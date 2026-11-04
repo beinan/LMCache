@@ -101,13 +101,12 @@ controller's decision.
 
 The CLI configures one or more L1 managers; `StorageManager.__init__` builds
 them with `create_l1_managers(config.l1_manager_configs)` and owns their
-lifetime. A lending L2 adapter adds a shadow L1 of borrowed views when it is
-registered and takes it away when it is deleted (see
-`l1_manager/l1-manager-types.md`, "Shadow L1"). `l1_managers()` returns the
-configured managers in placement order followed by the lenders' shadows, and
-`get_l1_manager_by_tags(tags)` the one manager with the given memory tags
-(`ValueError` for zero or several matches). Reporting and memory checks
-include every manager; write placement uses only the configured ones.
+lifetime. A lending L2 adapter brings a shadow L1 of borrowed views and takes
+it away when deleted (`l1_manager/l1-manager-types.md`, "Shadow L1").
+`l1_managers()` returns the configured managers in placement order, then the
+shadows; `get_l1_manager_by_tags(tags)` the one manager with the given memory
+tags (`ValueError` for zero or several matches). Reporting and memory checks
+cover every manager; write placement only the configured ones.
 
 `reserve_write(keys, layout)` asks the configured `WritePolicy`
 (`StorageManagerConfig.write_policy`, default `"default"`; there is no CLI
@@ -180,21 +179,19 @@ ownership, and serialized completion.
 configurations; `create_l1_manager` turns each into a `DramL1Manager`,
 `DevDaxL1Manager` or `GdsL1Manager`. The legacy singular config aliases the
 first entry. Each configured manager owns its allocator, eviction controller,
-and store controller; a shadow L1 has none of the three. Initialization rolls
-back already-created managers, shadows, adapters, and controllers on failure,
-and so does a failed `add_l2_adapter`.
+and store controller; a shadow L1 has none. Initialization and a failed
+`add_l2_adapter` roll back whatever they already created.
 
 L2 affinity is resolved from memory tags (see `memory_tags.md`): each adapter's
 config lists the L1 memory tags it wants, most preferred first, and
 `resolve_l1_affinity` picks the first L1 in placement order that has the most
 preferred matching tags. Stores and serde use that L1, and prefetch reloads
 allocate there. There is no pluggable affinity policy. An adapter that no L1
-matches, such as a host-buffer adapter in a GDS-only server, is rejected. An
-adapter that wants a `REMOTE` L1 first is a lender: it must be a
-`LendingPeerL2AdapterBase` without serde, and instead of resolving tags it gets a
-shadow L1 of its own as its affinity. Runtime adapter attachment updates the
-controller's mapping on its own loop thread; removal drops it after draining,
-which for a lender includes every view it lent.
+matches, such as a host-buffer adapter in a GDS-only server, is rejected. A
+lender (`LendingPeerL2AdapterBase`, wants `REMOTE` first, no serde) skips tag
+resolution: its own shadow L1 is its affinity. Runtime adapter attachment
+updates the controller's mapping on its own loop thread; removal drops it
+after draining, lent views included.
 
 Prefetch uses synchronous L1 calls and the existing per-manager lock maps. Its
 policy discards redundant copies and returns `PrefetchResult.l1_owners` for retained

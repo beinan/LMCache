@@ -154,11 +154,7 @@ earlier managers closed), `test_l1_interface.py` (contract against
 (gauge labels), `test_multi_l1.py` and `test_write_policy.py` (placement,
 registry), `test_devdax_l1_allocator.py` (primary-region warning, single-region
 adapter checks, hot-plug through the `/reconfigure/dax/l1/*` routes),
-`test_shadow_l1_manager.py` (shadow L1 admission, stale replacement, reaping
-on lease end and on read-TTL lapse, touch forwarding, deletion, release and
-`for_lender` with fake leases), `test_prefetch_controller.py::TestBorrowing`
-(the `lending_mock` adapter from `tests/v1/distributed/lending_mock.py`
-through the prefetch controller: borrowing, warm-prefetch skips, lender and
-shadow registration refusals, runtime add and removal that waits for live
-views) and `test_runtime_adapters.py` (the storage manager creating,
-refusing, reporting and closing a lender's shadow).
+`test_shadow_l1_manager.py` (the shadow L1 rules, with fake leases),
+`test_prefetch_controller.py::TestBorrowing` (borrowing through the prefetch
+controller with the `lending_mock` adapter) and `test_runtime_adapters.py`
+(the storage manager adding, refusing and closing a lender's shadow).

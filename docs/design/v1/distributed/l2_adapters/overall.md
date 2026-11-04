@@ -140,11 +140,10 @@ get_wanted_l1_memory_tags() -> tuple[MemoryTags, ...]  # adapter config
   first. The default `((DRAM, LOCAL), (CXL, LOCAL))` fits every host-buffer
   adapter; override it only for adapters that need a different L1.
 - The storage manager picks the adapter's L1 from these tags before building
-  the adapter. An adapter whose first wanted tags are `REMOTE` is a lender
-  (`LendingPeerL2AdapterBase`, `l2_adapters/p2p_l2_adapter.py`): it gets a shadow L1 of its
-  own instead, and the prefetch controller admits the views it lends there
-  (`../l1_manager/l1-manager-types.md`, "Shadow L1"). See `../memory_tags.md`
-  for the rules and the scope restriction.
+  the adapter. A lender (`LendingPeerL2AdapterBase`) wants `REMOTE` first and
+  gets a shadow L1 of its own instead (`../l1_manager/l1-manager-types.md`,
+  "Shadow L1"). See `../memory_tags.md` for the rules and the scope
+  restriction.
 
 ## StoreController
 
@@ -315,9 +314,8 @@ _poll_lookup_results
 _transition_to_load_phase
   ├─ policy plans over L1 hits and every adapter's found bitmap
   ├─ submit_unlock(keys) for every locked key outside the plan
-  │  (release_lookup(task_id, keys) for a lender)
-  ├─ lender: take_borrowed_objects(task_id, keys, layouts) -> views,
-  │  admitted into its shadow L1; no staging, no load task
+  │  (release_lookup for a lender)
+  ├─ lender: take_borrowed_objects(keys) -> views into its shadow L1; done
   ├─ L1 staging buffers reserved; on failure, submit_unlock for the
   │  affected keys and replan
   ├─ submit_load_task(keys, objs) per copying adapter in the plan

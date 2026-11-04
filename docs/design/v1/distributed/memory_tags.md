@@ -96,8 +96,8 @@ L1 managers that own payload are `LOCAL`. The segment names the primary pool:
 | `GDS` slab | `(GDS, LOCAL)` |
 | shadow (brought by a lending L2 adapter) | the borrowed segment, `REMOTE` |
 
-A shadow L1 holds only views of a peer's bytes, so it is `REMOTE`; see
-[l1_manager/l1-manager-types.md](l1_manager/l1-manager-types.md).
+A shadow L1 only indexes a peer's bytes, hence `REMOTE`
+(`l1_manager/l1-manager-types.md`, "Shadow L1").
 
 ### L2 own tags
 
