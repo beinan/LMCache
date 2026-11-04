@@ -103,10 +103,10 @@ never re-runs the policy; see [../storage_manager.md](../storage_manager.md).
 
 A shadow L1 is an index of memory somebody else owns. A lending peer adapter
 (`LendingPeerL2AdapterBase`, `l2_adapters/p2p_l2_adapter.py`) hands over
-borrowed views of a peer's KV bytes; `ShadowL1Manager` indexes those views so
-the ordinary read path (`lookup`, read locks, `finish_read`) serves them
-unchanged. It holds no bytes of its own and is never a hit source for
-prefetch: like P2P, every request looks the lender up.
+borrowed views of a peer's KV bytes; `ShadowL1Manager` indexes them so the
+ordinary read path (`lookup`, read locks, `finish_read`) serves them unchanged.
+It holds no bytes and, like P2P, is never a hit source: every prefetch looks
+the lender up.
 
 ```text
 lender ── take_borrowed_objects ──► views ── admit ──► shadow L1 ──► readers
@@ -115,26 +115,21 @@ lender ── take_borrowed_objects ──► views ── admit ──► shado
 ```
 
 - **It comes with the lender.** A lender wants a `REMOTE` L1 and maps peer
-  memory itself, like P2P, so there is nothing to configure. `StorageManager`
-  creates `ShadowL1Manager.for_lender(adapter_id, segment, defaults)` (tag
-  `shadow.<segment>.<adapter_id>`) when the adapter is added and binds it to
-  the adapter (`bind_shadow_l1`), which closes it with itself once its views
-  have drained. Serde on a lender, a `REMOTE`-wanting adapter that is not a
-  lender, or a lender that does not want `REMOTE` first, is refused before
-  anything is registered.
-- **Nothing is written, stored or evicted here.** The peer owns and evicts
-  the bytes. A view leaves with its last reader, the sweep, or the adapter.
-  Having no capacity, a shadow never gates prefetch admission either.
-- **The lookup is the renewal.** `admit` indexes and read-locks each view for
-  one request's readers. A key already resident keeps its view, which adopts
-  the fresh lease while its holders keep reading; the older reservation goes
-  back with the discarded view. No renew RPC exists.
+  memory itself, so nothing is configured. `StorageManager` creates
+  `ShadowL1Manager.for_lender(adapter_id, segment, defaults)` (tag
+  `shadow.<segment>.<adapter_id>`), binds it (`bind_shadow_l1`), and the
+  adapter closes it with itself. Serde on a lender, or a lender/`REMOTE`
+  mismatch in either direction, is refused before anything is registered.
+- **Nothing is written, stored or evicted here.** The peer owns the bytes.
+  No store or eviction controller; a shadow never gates prefetch admission.
+- **The lookup is the renewal.** `admit` read-locks each view for one request.
+  A key already resident keeps its view, which adopts the fresh lease; the
+  older reservation goes back. No renew RPC.
 - **A read must finish within the owner's TTL.** An ended lease refuses new
-  readers while a holder keeps its view until `finish_read`; past the TTL the
-  bytes may be gone. An entry whose readers' TTL lapsed is swept at the next
-  `admit`; nothing else would free it.
-- **Only `LOCK` prefetches borrow.** A warm (`NO_LOCK`) request never looks up
-  a lender: it would release the view at once, a false hit.
+  readers; a holder keeps its view until `finish_read`. An entry whose
+  readers' TTL lapsed is swept at the next `admit`.
+- **Only `LOCK` prefetches borrow.** A warm request would release the view at
+  once, a false hit.
 - **Status.** Tags are `(segment, REMOTE)`, so P2P never re-exports a view.
   A shadow is listed under `l1_managers` and makes `is_multi_l1` true.
 

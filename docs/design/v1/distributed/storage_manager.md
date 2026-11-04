@@ -101,12 +101,12 @@ controller's decision.
 
 The CLI configures one or more L1 managers; `StorageManager.__init__` builds
 them with `create_l1_managers(config.l1_manager_configs)` and owns their
-lifetime. A lending L2 adapter brings a shadow L1 of borrowed views and takes
-it away when deleted (`l1_manager/l1-manager-types.md`, "Shadow L1").
-`l1_managers()` returns the configured managers in placement order, then the
-shadows; `get_l1_manager_by_tags(tags)` the one manager with the given memory
-tags (`ValueError` for zero or several matches). Reporting and memory checks
-cover every manager; write placement only the configured ones.
+lifetime. A lending L2 adapter brings a shadow L1 of borrowed views while it
+is attached (`l1_manager/l1-manager-types.md`, "Shadow L1"). `l1_managers()`
+returns the configured managers in placement order, then the shadows;
+`get_l1_manager_by_tags(tags)` the one manager with the given memory tags
+(`ValueError` for zero or several matches). Reporting and memory checks cover
+every manager; write placement only the configured ones.
 
 `reserve_write(keys, layout)` asks the configured `WritePolicy`
 (`StorageManagerConfig.write_policy`, default `"default"`; there is no CLI
@@ -189,9 +189,7 @@ config lists the L1 memory tags it wants, most preferred first, and
 preferred matching tags. Stores and serde use that L1, and prefetch reloads
 allocate there. There is no pluggable affinity policy. An adapter that no L1
 matches, such as a host-buffer adapter in a GDS-only server, is rejected. A
-lender (`LendingPeerL2AdapterBase`, wants `REMOTE` first, no serde) skips tag
-resolution: the shadow L1 bound to it, which it closes with itself, is its
-affinity. Runtime adapter attachment
+lender's affinity is the shadow L1 bound to it. Runtime adapter attachment
 updates the controller's mapping on its own loop thread; removal drops it
 after draining, lent views included.
 
