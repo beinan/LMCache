@@ -43,8 +43,6 @@ from lmcache.v1.distributed.l2_adapters.fault_inject_l2_adapter import (
     FaultInjectL2Adapter,
 )
 from lmcache.v1.distributed.l2_adapters.mock_l2_adapter import (
-    LendingMockL2Adapter,
-    LendingMockL2AdapterConfig,
     MockL2Adapter,
     MockL2AdapterConfig,
 )
@@ -71,6 +69,10 @@ from lmcache.v1.memory_management import (
     MemoryFormat,
     MemoryObjMetadata,
     TensorMemoryObj,
+)
+from tests.v1.distributed.lending_mock import (
+    LendingMockL2Adapter,
+    LendingMockL2AdapterConfig,
 )
 from tests.v1.distributed.utils import should_use_lazy_alloc
 
@@ -2029,36 +2031,45 @@ def make_borrowing_controller(
 
 
 class TestBorrowing:
-    def test_lender_needs_its_shadow(self, l1_manager):
-        """A lending adapter without a shadow L1 is refused, at construction
-        and at runtime, instead of binding to some other L1."""
-        shadow, adapter = make_lender(l1_manager)
-        descriptor = L2AdapterDescriptor(
+    def test_registration_refuses_a_lender_or_shadow_on_its_own(self, l1_manager):
+        """A lender without a shadow L1, or a shadow L1 on an adapter that
+        cannot lend, is refused at construction and at runtime instead of
+        binding to some other L1 or raising inside the loop on a hit."""
+        shadow, lender = make_lender(l1_manager)
+        copier = make_adapter()
+        lender_desc = L2AdapterDescriptor(
             index=0,
             config=LendingMockL2AdapterConfig(max_size_gb=0.01, mock_bandwidth_gb=10.0),
         )
+        l1_desc = L1ManagerDescriptor(
+            index=l1_manager.l1_manager_id, config=l1_manager.config
+        )
         try:
-            with pytest.raises(ValueError, match="shadow L1"):
-                PrefetchController(
-                    l1_managers=[l1_manager],
-                    l1_manager_descriptors=[
-                        L1ManagerDescriptor(
-                            index=l1_manager.l1_manager_id, config=l1_manager.config
-                        )
-                    ],
-                    l2_adapters=[adapter],
-                    adapter_descriptors=[descriptor],
-                    policy=DefaultPrefetchPolicy(),
-                )
+            for adapter, desc, shadows, match in (
+                (lender, lender_desc, {}, "shadow L1"),
+                (copier, make_descriptor(0), {0: shadow}, "does not lend"),
+            ):
+                with pytest.raises(ValueError, match=match):
+                    PrefetchController(
+                        l1_managers=[l1_manager],
+                        l1_manager_descriptors=[l1_desc],
+                        l2_adapters=[adapter],
+                        adapter_descriptors=[desc],
+                        policy=DefaultPrefetchPolicy(),
+                        shadow_l1s=shadows,
+                    )
             ctrl = make_controller(l1_manager, [])
             ctrl.start()
             try:
                 with pytest.raises(ValueError, match="shadow L1"):
-                    ctrl.add_adapter(0, adapter, descriptor)
+                    ctrl.add_adapter(0, lender, lender_desc)
+                with pytest.raises(ValueError, match="does not lend"):
+                    ctrl.add_adapter(0, copier, make_descriptor(0), shadow_l1=shadow)
             finally:
                 ctrl.stop()
         finally:
-            adapter.close()
+            lender.close()
+            copier.close()
             shadow.close()
 
     def test_runtime_lender_brings_and_takes_its_shadow(self, l1_manager):

@@ -149,11 +149,9 @@ class StorageManager:
         with ExitStack() as cleanup:
             self._event_bus = get_event_bus()
 
-            # L1 Managers. The configured ones own memory; a lending L2
-            # adapter adds a shadow L1 of borrowed views (see
-            # _build_l2_adapter). ``_l1_managers`` lists both kinds; the
-            # containers are replaced, never mutated, so readers on other
-            # threads see a consistent snapshot.
+            # L1 Managers: the configured ones own memory; a lending L2 adapter
+            # adds a shadow L1 (_build_l2_adapter). The L1 containers are
+            # replaced, never mutated, so other threads see a snapshot.
             self._owned_l1_managers: list[L1ManagerInterface] = create_l1_managers(
                 config.l1_manager_configs
             )
@@ -171,9 +169,8 @@ class StorageManager:
 
             self._write_policy = create_write_policy(config.write_policy)
 
-            # L1 Eviction reclaims memory an L1 owns. A shadow L1 indexes a
-            # peer's bytes, whose owner evicts them, so it gets no controller
-            # whether or not it accepts writes.
+            # L1 Eviction reclaims memory an L1 owns; a shadow L1 indexes a
+            # peer's bytes, which the peer evicts, so it gets no controller.
             self._eviction_controllers = {
                 m.config.tag: L1EvictionController(
                     m, m.config.eviction or config.eviction_config
@@ -258,8 +255,7 @@ class StorageManager:
             # Controllers receive the initial set as ordered lists; they key
             # their own copies by ``descriptor.index`` (== adapter_id) and learn
             # of later changes via add_adapter/request_remove_adapter. A
-            # lending adapter stores nothing and belongs to no store
-            # controller; the prefetch controller gets its shadow L1.
+            # lending adapter stores nothing: no store controller for it.
             self._store_controllers: dict[int, StoreController] = {}
             for manager in self._owned_l1_managers:
                 descriptors = [
@@ -1244,8 +1240,7 @@ class StorageManager:
                         "controller"
                     )
                 self._l2_eviction_controller.remove_adapter_state(adapter_id)
-                # The prefetch controller detached the adapter only once its
-                # borrowed views drained, so its shadow L1 is empty now.
+                # The prefetch drain waited for every borrowed view.
                 self._detach_shadow(adapter_id)
                 # From here the adapter is detached: not active, but kept in
                 # the registry until its close succeeds.
@@ -1335,18 +1330,15 @@ class StorageManager:
 
         Gates the per-tag status shape, owner-routed read completion and the
         ``L1[tag]`` device-owner names; reads without owners still resolve.
-        A lending adapter added at runtime brings a shadow L1 and can turn
-        this on.
+        A lending adapter added at runtime brings a shadow L1 and can turn it on.
         """
         return len(self._l1_managers) > 1
 
     def report_status(self) -> dict:
         """Return per-L1 status and aggregate health; retain single-L1 field names.
 
-        ``l1_managers`` lists every L1, shadow L1s included;
-        ``store_controllers`` and ``l1_eviction_controllers`` have an entry per
-        L1 that owns its memory only, since a shadow L1 stores and evicts
-        nothing.
+        ``store_controllers`` and ``l1_eviction_controllers`` list only L1s
+        that own memory; ``l1_managers`` includes shadow L1s.
         """
         managers = self._l1_managers
         tags = [m.config.tag for m in managers]
@@ -1627,10 +1619,8 @@ class StorageManager:
                 the adapter lends views of a segment no L1 medium backs.
 
         Note:
-            A lending adapter wants a ``REMOTE`` L1: it resolves and maps the
-            peers' memory itself, like the P2P workflow, and admits views of
-            it into a shadow L1 created here for it. The shadow is attached
-            to this manager's L1 set and lives as long as the adapter.
+            A lending adapter (wants a ``REMOTE`` L1) maps peer memory itself;
+            it gets a shadow L1 created here, which lives as long as it does.
         """
         adapter_id = self._next_adapter_id
         self._next_adapter_id += 1

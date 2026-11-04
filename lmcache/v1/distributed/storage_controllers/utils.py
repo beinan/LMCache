@@ -11,17 +11,24 @@ and the L1 affinity resolver for L2 adapters.
 # Standard
 from collections.abc import ItemsView, Iterator, Mapping
 from dataclasses import dataclass
-from typing import TypeVar
+from typing import Protocol, TypeVar, runtime_checkable
 
 # First Party
 from lmcache.lmcache_native import Bitmap
-from lmcache.v1.distributed.api import MemoryResidency, MemorySegment
+from lmcache.v1.distributed.api import (
+    MemoryLayoutDesc,
+    MemoryResidency,
+    MemorySegment,
+    ObjectKey,
+)
 from lmcache.v1.distributed.config import L1ManagerConfig
 from lmcache.v1.distributed.internal_api import L1ManagerInterface
+from lmcache.v1.distributed.l2_adapters.base import L2TaskId
 from lmcache.v1.distributed.l2_adapters.config import (
     L2AdapterConfigBase,
     get_type_name_for_config,
 )
+from lmcache.v1.memory_management import BorrowedTensorMemoryObj
 
 _K = TypeVar("_K")
 
@@ -412,12 +419,37 @@ class MapState:
         return self
 
 
+@runtime_checkable
+class LendingL2Adapter(Protocol):
+    """What the prefetch controller needs from an adapter that lends views.
+
+    Checked structurally when a shadow L1 attaches, so the controller imports
+    no adapter module; ``PeerL2AdapterBase`` provides the methods.
+    """
+
+    def take_borrowed_objects(
+        self,
+        task_id: L2TaskId,
+        keys: list[ObjectKey],
+        layouts: dict[int, MemoryLayoutDesc],
+    ) -> dict[ObjectKey, BorrowedTensorMemoryObj]:
+        """Lend a view per key it can lend; never raise after creating one."""
+        ...
+
+    def release_lookup(self, task_id: L2TaskId, keys: list[ObjectKey]) -> None:
+        """Return the reservations of a lookup that were not moved into views."""
+        ...
+
+    def get_active_borrow_count(self) -> int:
+        """Return live borrowed views which must drain before removal."""
+        ...
+
+
 def borrowed_segment(adapter_config: L2AdapterConfigBase) -> MemorySegment | None:
     """Return the segment an L2 adapter borrows views of, if it lends.
 
-    A lending adapter wants a ``REMOTE`` L1 first: it admits views of a
-    peer's bytes into a shadow L1 it brings with it, instead of copying into
-    a local L1. A copying adapter wants ``LOCAL`` L1 buffers.
+    A lending adapter wants a ``REMOTE`` L1 first; a copying one wants
+    ``LOCAL`` buffers.
 
     Args:
         adapter_config: The L2 adapter's configuration.

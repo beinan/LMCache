@@ -34,7 +34,6 @@ from lmcache.v1.distributed.config import (
 from lmcache.v1.distributed.l1_manager import DramL1Manager
 from lmcache.v1.distributed.l2_adapters.config import L2AdaptersConfig
 from lmcache.v1.distributed.l2_adapters.mock_l2_adapter import (
-    LendingMockL2AdapterConfig,
     MockL2Adapter,
     MockL2AdapterConfig,
 )
@@ -44,6 +43,7 @@ from lmcache.v1.distributed.storage_controllers.store_policy import (
 )
 from lmcache.v1.distributed.storage_controllers.utils import L2AdapterDescriptor
 from lmcache.v1.distributed.storage_manager import StorageManager, l1_owners_of
+from tests.v1.distributed.lending_mock import LendingMockL2AdapterConfig
 from tests.v1.distributed.utils import should_use_lazy_alloc
 
 if not torch_dev.is_available():

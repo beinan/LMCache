@@ -28,8 +28,7 @@ from lmcache.v1.distributed.memory_manager import ShadowL1MemoryManager
 from lmcache.v1.memory_management import BorrowedTensorMemoryObj, MemoryObj
 from lmcache.v1.mp_observability.event import Event, EventType
 
-# The L1 medium a borrowed segment is reported as: a peer's DRAM view counts
-# as DRAM, a peer's CXL view as Device-DAX. Segments no L1 backs cannot be
+# The L1 medium a borrowed segment is reported as; other segments cannot be
 # borrowed.
 _BACKEND_BY_SEGMENT: dict[MemorySegment, L1BackendType] = {
     MemorySegment.DRAM: L1BackendType.DRAM,
@@ -45,10 +44,8 @@ class ShadowL1Manager(BaseL1Manager):
     :class:`BorrowedTensorMemoryObj` objects; this manager indexes them by key
     so the ordinary read path (read locks, ``finish_read``, events) serves
     them. Freeing an object ends its lease instead of returning memory. The
-    manager has no capacity, so write placement never targets it, and it runs
-    no eviction controller: the peer that owns the bytes evicts them, and
-    views leave here when their last reader finishes or
-    :meth:`reap_expired` collects them.
+    manager has no capacity, so write placement never targets it and it has
+    no eviction controller: the peer that owns the bytes evicts them.
 
     A view whose lease ended is never handed to a new reader. A reader that
     already holds it keeps it until its last ``finish_read`` (views are
@@ -81,11 +78,9 @@ class ShadowL1Manager(BaseL1Manager):
     ) -> "ShadowL1Manager":
         """Create the shadow L1 a lending L2 adapter brings with it.
 
-        The adapter resolves and maps the peers' memory, like the P2P
-        workflow; nothing about the borrowed bytes is known in advance, so
-        the shadow needs no size or device. It takes the lock TTLs from
-        ``defaults``, is tagged ``shadow.<segment>.<adapter_id>``, and has no
-        memory of its own.
+        The adapter maps the peers' memory itself, so the shadow needs no size
+        or device: it takes the lock TTLs from ``defaults`` and is tagged
+        ``shadow.<segment>.<adapter_id>``.
 
         Args:
             adapter_id: Stable id of the lending adapter; makes the tag unique.
@@ -163,8 +158,8 @@ class ShadowL1Manager(BaseL1Manager):
                 and not entry.memory_obj.is_valid()
                 and not entry.read_lock.is_locked()
             ):
-                # Stale and unheld: the reaper would collect it; do so now
-                # so the fresh view is not refused behind it.
+                # Stale and unheld: collect it now rather than refuse the
+                # fresh view until the reaper runs.
                 replaced_keys.append(key)
                 replaced.append(self._objects.pop(key).memory_obj)
                 entry = None
@@ -214,14 +209,12 @@ class ShadowL1Manager(BaseL1Manager):
 
     @l1_mgr_synchronized
     def reap_expired(self) -> None:
-        """Release every view no reader holds.
+        """Release every view no reader holds, whatever its lease says.
 
-        A view is unheld once its last ``finish_read`` ran (which frees it
-        at once) or its read lock's TTL lapsed, in which case a late
-        ``finish_read`` is refused and would never free it. The lease state
-        does not matter: an unheld view serves nobody, and a reader past its
-        TTL is treated as gone, as in every L1. A held view whose lease ended
-        stays, unreadable to new readers, until its last ``finish_read``.
+        A view whose read-lock TTL lapsed is unheld: its reader counts as
+        gone, as in every L1, and its late ``finish_read`` is refused, so
+        nothing else would free it. A held view whose lease ended stays,
+        unreadable to new readers, until its last ``finish_read``.
         """
         expired = [
             key
