@@ -5,9 +5,9 @@
   implement :class:`~lmcache.v1.distributed.internal_api.L1ManagerInterface`
   for one memory medium each, sharing the state machine in ``base.py``
   (an implementation detail of this package).
-- :class:`ShadowL1Manager` indexes borrowed views whose bytes a peer owns; it
-  stores no payload, is never a write target, and is created by the storage
-  manager for the lending L2 adapter that brings it, not from configuration.
+- :class:`ShadowL1Manager` is an index of a peer's memory: borrowed views,
+  no bytes of its own, reads only. A lending L2 adapter brings it; nothing
+  configures it.
 - :func:`create_l1_manager` / :func:`create_l1_managers` pick the subclass
   from an :class:`~lmcache.v1.distributed.config.L1ManagerConfig`.
 """
