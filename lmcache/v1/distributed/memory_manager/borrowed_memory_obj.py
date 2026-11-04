@@ -2,7 +2,7 @@
 """A tensor view of bytes another party owns, held under a lease."""
 
 # Standard
-from typing import Callable, Optional
+from typing import Callable
 
 # Third Party
 import torch
@@ -27,10 +27,6 @@ class BorrowedTensorMemoryObj(TensorMemoryObj):
         on_release: Ends the lease; idempotent, nonblocking, and takes no lock
             the caller might hold. It runs under the L1 manager's lock, so it
             must never call back into an L1 manager.
-        on_touch: Optional; called when a reader hits the view, so the lender
-            can renew a lease that is near its end. Same rules as
-            ``on_release``; it may also run after :meth:`release` and must
-            then do nothing.
     """
 
     def __init__(
@@ -40,12 +36,28 @@ class BorrowedTensorMemoryObj(TensorMemoryObj):
         *,
         lease_is_valid: Callable[[], bool],
         on_release: Callable[[], None],
-        on_touch: Optional[Callable[[], None]] = None,
     ) -> None:
         super().__init__(raw_data, metadata, parent_allocator=None)
         self._lease_is_valid = lease_is_valid
         self._on_release = on_release
-        self._on_touch = on_touch
+
+    @property
+    def lease(self) -> tuple[Callable[[], bool], Callable[[], None]]:
+        """Return the view's ``(lease_is_valid, on_release)`` pair."""
+        return self._lease_is_valid, self._on_release
+
+    def replace_lease(
+        self, lease_is_valid: Callable[[], bool], on_release: Callable[[], None]
+    ) -> None:
+        """Put the view under another lease, e.g. a newer reservation of the
+        same bytes; the previous lease is neither kept nor released here.
+
+        Args:
+            lease_is_valid: Nonblocking check that the new lease still holds.
+            on_release: Ends the new lease; same rules as the constructor's.
+        """
+        self._lease_is_valid = lease_is_valid
+        self._on_release = on_release
 
     def is_valid(self) -> bool:
         """Return whether the view is unreleased and its lease still holds."""
@@ -54,8 +66,3 @@ class BorrowedTensorMemoryObj(TensorMemoryObj):
     def release(self) -> None:
         """End the lease; repeated calls are no-ops."""
         self._on_release()
-
-    def touch(self) -> None:
-        """Tell the lender a reader hit the view, if it asked to know."""
-        if self._on_touch is not None:
-            self._on_touch()

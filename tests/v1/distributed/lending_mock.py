@@ -126,7 +126,6 @@ class LendingMockL2Adapter(LendingPeerL2AdapterBase):
         self._reserved: dict[ObjectKey, int] = {}
         self._live_views = 0
         self.lookup_count = 0
-        self.touch_count = 0
         # While set, lookup results are withheld so several requests can have
         # lookups of the same key outstanding at once.
         self.hold_lookups = False
@@ -215,15 +214,11 @@ class LendingMockL2Adapter(LendingPeerL2AdapterBase):
                     self._live_views -= 1
                     PeerL2AdapterBase.submit_unlock(self, [key])
 
-            def touched() -> None:
-                self.touch_count += 1
-
             views[key] = BorrowedTensorMemoryObj(
                 stored.raw_data,
                 stored.meta,
                 lease_is_valid=lease_is_valid,
                 on_release=end_lease,
-                on_touch=touched,
             )
         return views
 

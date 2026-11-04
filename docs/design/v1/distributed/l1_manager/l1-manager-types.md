@@ -105,12 +105,13 @@ A shadow L1 is an index of memory somebody else owns. A lending peer adapter
 (`LendingPeerL2AdapterBase`, `l2_adapters/p2p_l2_adapter.py`) hands over
 borrowed views of a peer's KV bytes; `ShadowL1Manager` indexes those views so
 the ordinary read path (`lookup`, read locks, `finish_read`) serves them
-unchanged. It holds no bytes of its own.
+unchanged. It holds no bytes of its own and is never a hit source for
+prefetch: like P2P, every request looks the lender up.
 
 ```text
 lender ── take_borrowed_objects ──► views ── admit ──► shadow L1 ──► readers
-  ▲ on_touch: a reader hit, so the lender can renew the lease   │
-  └──── release: last finish_read, reaper, or adapter close ◄───┘
+  ▲ a key already resident adopts the fresh lease; the older one returns │
+  └──── release: last finish_read, sweep at the next admit, or close ◄───┘
 ```
 
 - **It comes with the lender.** A lender wants a `REMOTE` L1 and maps peer
@@ -118,20 +119,22 @@ lender ── take_borrowed_objects ──► views ── admit ──► shado
   creates `ShadowL1Manager.for_lender(adapter_id, segment, defaults)` (tag
   `shadow.<segment>.<adapter_id>`) when the adapter is added and binds it to
   the adapter (`bind_shadow_l1`), which closes it with itself once its views
-  have drained. Serde on a lender, or a `REMOTE`-wanting adapter that is not
-  a lender, is refused before anything is registered.
+  have drained. Serde on a lender, a `REMOTE`-wanting adapter that is not a
+  lender, or a lender that does not want `REMOTE` first, is refused before
+  anything is registered.
 - **Nothing is written, stored or evicted here.** The peer owns and evicts
-  the bytes. A view leaves with its last reader, the reaper, or the adapter.
+  the bytes. A view leaves with its last reader, the sweep, or the adapter.
   Having no capacity, a shadow never gates prefetch admission either.
-- **A view lives only while held.** `admit` indexes and read-locks each view;
-  a resident valid view wins over a duplicate, a stale unheld one is replaced.
-  An ended lease refuses new readers while a holder keeps its view until
-  `finish_read`. The shadow's own reaper thread (one per lender) frees every
-  unheld view, lease or not: after a read-lock TTL lapses nothing else would.
-- **Reads renew.** Every hit reaches the view's `on_touch`, lock-free, so the
-  lender can extend the lease. A hot view lives as long as it is read.
-- **Only `LOCK` prefetches borrow.** A warm (`NO_LOCK`) request skips lenders
-  and shadow L1s: its unlock could free a view under its readers.
+- **The lookup is the renewal.** `admit` indexes and read-locks each view for
+  one request's readers. A key already resident keeps its view, which adopts
+  the fresh lease while its holders keep reading; the older reservation goes
+  back with the discarded view. No renew RPC exists.
+- **A read must finish within the owner's TTL.** An ended lease refuses new
+  readers while a holder keeps its view until `finish_read`; past the TTL the
+  bytes may be gone. An entry whose readers' TTL lapsed is swept at the next
+  `admit`; nothing else would free it.
+- **Only `LOCK` prefetches borrow.** A warm (`NO_LOCK`) request never looks up
+  a lender: it would release the view at once, a false hit.
 - **Status.** Tags are `(segment, REMOTE)`, so P2P never re-exports a view.
   A shadow is listed under `l1_managers` and makes `is_multi_l1` true.
 

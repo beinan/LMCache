@@ -425,7 +425,10 @@ class LendingPeerL2AdapterBase(PeerL2AdapterBase):
     A lookup hit reserves the key at the peer. A reservation that
     :meth:`take_borrowed_objects` moves into a view belongs to the view and
     ends with its release; the controller returns the others with the usual
-    ``submit_unlock``, which never names a key that became a view.
+    ``submit_unlock``, which never names a key that became a view. Every
+    request looks the lender up, so a view already resident in the shadow
+    adopts the newer lease and the older reservation comes back through the
+    discarded view's release: the lookup is the renewal.
     """
 
     def __init__(self, config: PeerL2AdapterConfigBase) -> None:

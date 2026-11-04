@@ -59,7 +59,8 @@ means, while the polling, timeout and failure handling around it stay shared:
 
 `LendingPeerL2AdapterBase` is abstract and adds `take_borrowed_objects` and
 `get_active_borrow_count`; a reservation moved into a view belongs to the view,
-and the controller unlocks only the keys that did not become views. Being that
+and the controller unlocks only the keys that did not become views; every
+lookup refreshes the lease of a key already resident in the shadow. Being that
 type, with a config that wants a `REMOTE` L1 first (`borrowed_segment`), is
 what earns an adapter a shadow L1, bound with `bind_shadow_l1` and closed with
 the adapter (`../l1_manager/l1-manager-types.md`, "Shadow L1"). It cannot use

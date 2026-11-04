@@ -51,7 +51,6 @@ from lmcache.v1.distributed.l2_adapters.raw_block_l2_adapter import (
     RawBlockL2Adapter,
     RawBlockL2AdapterConfig,
 )
-from lmcache.v1.distributed.memory_manager import BorrowedTensorMemoryObj
 from lmcache.v1.distributed.storage_controllers.prefetch_controller import (
     PrefetchController,
 )
@@ -66,7 +65,6 @@ from lmcache.v1.distributed.storage_controllers.utils import (
     L2AdapterDescriptor,
 )
 from lmcache.v1.memory_management import (
-    MemoryFormat,
     MemoryObjMetadata,
     TensorMemoryObj,
 )
@@ -2116,7 +2114,8 @@ class TestBorrowing:
         together both hit: the second request is admitted while the first is
         still looking up (a shadow L1 has no capacity to gate on), and the
         first borrower's unlock must not return the second one's reservation.
-        The resident view then serves both readers under one peer lock."""
+        The resident view adopts the second lease and serves both readers
+        under one peer lock."""
         shadow, adapter = make_lender(l1_manager)
         key = make_object_key(0)
         store_keys_in_l2(adapter, [key], make_layout())
@@ -2142,58 +2141,34 @@ class TestBorrowing:
 
     def test_warm_prefetch_skips_lender_and_shadow_l1(self, l1_manager):
         """A NO_LOCK prefetch neither looks up a lender (a borrowed view cannot
-        outlive its read locks, so it would be a false hit) nor a shadow L1 (a
-        view held there belongs to its readers). A LOCK prefetch still hits."""
+        outlive its read locks, so it would be a false hit) nor reads a shadow
+        L1; a LOCK prefetch borrows afresh even for a key already resident,
+        instead of hitting the shadow."""
         shadow, adapter = make_lender(l1_manager)
-        layout = make_layout()
-        key, other = make_object_key(0), make_object_key(1)
-        store_keys_in_l2(adapter, [other], layout)
-        released: list[bool] = []
-        touches: list[bool] = []
-        view = BorrowedTensorMemoryObj(
-            torch.zeros(layout.shapes[0], dtype=layout.dtypes[0]),
-            MemoryObjMetadata(
-                shape=layout.shapes[0],
-                dtype=layout.dtypes[0],
-                address=0,
-                phy_size=layout.shapes[0].numel(),
-                ref_count=1,
-                fmt=MemoryFormat.KV_2LTD,
-                shapes=layout.shapes,
-                dtypes=layout.dtypes,
-            ),
-            lease_is_valid=lambda: not released,
-            on_release=lambda: released.append(True),
-            on_touch=lambda: touches.append(True),
-        )
-        assert shadow.admit({key: view})[key][0] == L1Error.SUCCESS
+        key = make_object_key(0)
+        store_keys_in_l2(adapter, [key], make_layout())
         ctrl = make_borrowing_controller(l1_manager, adapter)
         ctrl.start()
         try:
             warm = wait_for_result(
                 ctrl,
                 ctrl.submit_prefetch_request(
-                    single_row_spec([key, other], lock_mode=PrefetchLockMode.NO_LOCK)
+                    single_row_spec([key], lock_mode=PrefetchLockMode.NO_LOCK)
                 ),
             )
             assert row_bits(warm) == []
             assert adapter.lookup_count == 0
             assert_l2_unlocked(adapter)
-            assert shadow.unsafe_read([key])[key][0] == L1Error.SUCCESS
-            assert not released
 
-            locked = wait_for_result(
-                ctrl, ctrl.submit_prefetch_request(single_row_spec([key]))
-            )
-            assert row_bits(locked) == [0]
-            assert locked is not None
-            assert locked.l1_owners == {key: shadow.l1_manager_id}
-            assert released == []  # the warm request touched nothing
-            assert touches == [True]  # the LOCK hit told the lender
-            shadow.finish_read([key])  # the LOCK prefetch's lock
-            assert not released
-            shadow.finish_read([key])  # the original holder's lock
-            assert released
+            for expected_lookups in (1, 2):
+                hit = wait_for_result(
+                    ctrl, ctrl.submit_prefetch_request(single_row_spec([key]))
+                )
+                assert row_bits(hit) == [0]
+                assert adapter.lookup_count == expected_lookups
+            assert adapter.debug_get_locked_key_count() == 1
+            shadow.finish_read([key], read_locks=2)
+            assert_l2_unlocked(adapter)
         finally:
             ctrl.stop()
             adapter.close()

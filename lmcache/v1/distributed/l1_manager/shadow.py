@@ -5,7 +5,6 @@
 from collections.abc import Mapping
 from dataclasses import replace
 from typing import cast
-import threading
 
 # First Party
 from lmcache import torch_dev
@@ -41,10 +40,6 @@ _BACKEND_BY_SEGMENT: dict[MemorySegment, L1BackendType] = {
     MemorySegment.GDS: L1BackendType.GDS,
 }
 
-# How often a shadow's reaper thread (one per lender) frees the views whose
-# readers' TTL lapsed.
-_REAP_INTERVAL_S = 0.5
-
 
 class ShadowL1Manager(BaseL1Manager):
     """L1 manager whose objects are borrowed views: metadata only, no payload.
@@ -56,11 +51,13 @@ class ShadowL1Manager(BaseL1Manager):
     manager has no capacity, so write placement never targets it and it has
     no eviction controller: the peer that owns the bytes evicts them.
 
-    A view whose lease ended is never handed to a new reader. A reader that
-    already holds it keeps it until its last ``finish_read`` (views are
-    temporary), so a copy in flight is never torn down within its read-lock
-    TTL; past the TTL the reader counts as gone, as in every L1, and the
-    manager's own reaper thread frees the view.
+    A view is admitted for one request's readers. Every request looks the
+    lender up, so a key already resident adopts the newer lease while its
+    holders keep reading, and the older reservation goes back. A view whose
+    lease ended is never handed to a new reader; a holder keeps it until its
+    last ``finish_read``, so a read must finish within the owner's TTL. An
+    entry whose readers' TTL lapsed is swept at the next ``admit``; nothing
+    else frees it.
     """
 
     def __init__(
@@ -82,11 +79,6 @@ class ShadowL1Manager(BaseL1Manager):
             segment=segment, residency=MemoryResidency.REMOTE
         )
         super().__init__(config, ShadowL1MemoryManager())
-        self._stop_reaper = threading.Event()
-        self._reaper = threading.Thread(
-            target=self._reap_loop, name=f"shadow-reaper-{config.tag}", daemon=True
-        )
-        self._reaper.start()
 
     @classmethod
     def for_lender(
@@ -140,9 +132,12 @@ class ShadowL1Manager(BaseL1Manager):
     ) -> dict[ObjectKey, L1OperationResult]:
         """Make borrowed views resident and read-lock them, without allocating.
 
-        The view's ownership passes to this manager: every view not kept
-        resident is released before returning. A resident view whose lease
-        ended and that no reader holds is replaced by the given view.
+        The views' ownership passes to this manager: every view not kept
+        resident is released before returning. A key already resident keeps
+        its view, which adopts the given view's lease; the given view is
+        released under the older lease, returning the older reservation.
+        Entries no reader holds any more (their readers' TTL lapsed) are
+        swept first.
 
         Args:
             objects: Borrowed view per key.
@@ -150,11 +145,8 @@ class ShadowL1Manager(BaseL1Manager):
 
         Returns:
             Per key: ``(SUCCESS, obj)`` with the resident object now
-            read-locked -- the given view, or an already-resident one, in
-            which case the given view is released; ``(KEY_NOT_READABLE,
-            None)`` when the resident view's lease ended while readers still
-            hold it; ``(KEY_IN_WRONG_STATE, None)`` when the given view's
-            lease ended before admission.
+            read-locked, or ``(KEY_IN_WRONG_STATE, None)`` when the given
+            view's lease ended before admission.
 
         Raises:
             ValueError: If ``read_locks`` is out of range.
@@ -165,30 +157,29 @@ class ShadowL1Manager(BaseL1Manager):
         admitted_meta: list[L1ObjectMeta] = []
         resident_keys: list[ObjectKey] = []
         discarded: list[MemoryObj] = []
-        replaced_keys: list[ObjectKey] = []
-        replaced: list[MemoryObj] = []
+        # Temporary views leave at their last finish_read, so an unheld entry
+        # is one whose readers' TTL lapsed; its late finish_read is refused.
+        lapsed = [
+            key
+            for key, entry in self._objects.items()
+            if not entry.read_lock.is_locked()
+        ]
+        lapsed_objs = [self._objects.pop(key).memory_obj for key in lapsed]
         for key, obj in objects.items():
-            entry = self._objects.get(key)
-            if (
-                entry is not None
-                and not entry.memory_obj.is_valid()
-                and not entry.read_lock.is_locked()
-            ):
-                # Stale and unheld: collect it now rather than refuse the
-                # fresh view until the reaper runs.
-                replaced_keys.append(key)
-                replaced.append(self._objects.pop(key).memory_obj)
-                entry = None
-            if entry is not None:
-                discarded.append(obj)
-                if not entry.memory_obj.is_valid():
-                    ret[key] = (L1Error.KEY_NOT_READABLE, None)
-                    continue
-                resident_keys.append(key)
-            elif not obj.is_valid():
+            if not obj.is_valid():
                 discarded.append(obj)
                 ret[key] = (L1Error.KEY_IN_WRONG_STATE, None)
                 continue
+            entry = self._objects.get(key)
+            if entry is not None:
+                # Held by earlier readers: the fresh lease renews it, and the
+                # older reservation goes back with the discarded view.
+                resident = cast(BorrowedTensorMemoryObj, entry.memory_obj)
+                older = resident.lease
+                resident.replace_lease(*obj.lease)
+                obj.replace_lease(*older)
+                discarded.append(obj)
+                resident_keys.append(key)
             else:
                 entry = L1ObjectState(
                     memory_obj=obj,
@@ -204,8 +195,8 @@ class ShadowL1Manager(BaseL1Manager):
                 entry.read_lock.lock()
             ret[key] = (L1Error.SUCCESS, entry.memory_obj)
 
-        if replaced_keys:
-            self._free_and_report_deleted(replaced_keys, replaced)
+        if lapsed:
+            self._free_and_report_deleted(lapsed, lapsed_objs)
         self._memory_manager.free(discarded)
         if resident_keys:
             self._report_read_reserved(resident_keys)
@@ -234,7 +225,7 @@ class ShadowL1Manager(BaseL1Manager):
         Same contract as ``BaseL1Manager.reserve_read`` with that one extra
         refusal, checked under the same lock as the reservation: the peer can
         end a lease at any time, and a new reader must never get a view it
-        cannot read. The reaper frees the view once no reader holds it.
+        cannot read. The next ``admit`` sweeps the view once no reader holds it.
         """
         total = validate_read_locks(read_locks)
         ret: dict[ObjectKey, L1OperationResult] = {}
@@ -259,50 +250,13 @@ class ShadowL1Manager(BaseL1Manager):
                 ret[key] = (L1Error.KEY_NOT_READABLE, None)
         return ret
 
-    def touch_keys(self, keys: list[ObjectKey]) -> None:
-        """Report the hits as usual, and tell each valid view's lender.
-
-        A lender renews a lease that is near its end on a touch; otherwise a
-        hot view would die after one owner TTL however often it is read.
-        Lock-free like the base, on the retrieve hot path, so a touch may
-        race with the view's release; ``on_touch`` must then be a no-op.
-
-        Args:
-            keys: The keys a reader hit.
-        """
-        super().touch_keys(keys)
-        for key in keys:
-            entry = self._objects.get(key)
-            if entry is not None and entry.memory_obj.is_valid():
-                cast(BorrowedTensorMemoryObj, entry.memory_obj).touch()
-
-    @l1_mgr_synchronized
-    def reap_expired(self) -> None:
-        """Release every view no reader holds, whatever its lease says.
-
-        A view whose read-lock TTL lapsed is unheld: its reader counts as
-        gone, as in every L1, and its late ``finish_read`` is refused, so
-        nothing else would free it. A held view whose lease ended stays,
-        unreadable to new readers, until its last ``finish_read``.
-        """
-        expired = [
-            key
-            for key, entry in self._objects.items()
-            if not entry.read_lock.is_locked()
-        ]
-        if expired:
-            objs = [self._objects.pop(key).memory_obj for key in expired]
-            self._free_and_report_deleted(expired, objs)
-
     def close(self) -> None:
-        """Stop the reaper and release every view, read-locked or not.
+        """Release every view, read-locked or not; idempotent.
 
-        Idempotent. Call after stopping new controller and GPU submissions;
-        outstanding work on every device is synchronized first so no copy
-        reads a released view.
+        Call after stopping new controller and GPU submissions; outstanding
+        work on every device is synchronized first so no copy reads a
+        released view.
         """
-        self._stop_reaper.set()
-        self._reaper.join()
         if torch_dev.is_available():
             for device in range(torch_dev.device_count()):
                 torch_dev.synchronize(device)
@@ -311,7 +265,3 @@ class ShadowL1Manager(BaseL1Manager):
     def _object_meta(self, memory_obj: MemoryObj) -> L1ObjectMeta:
         """Report borrowed views as holding no local bytes."""
         return L1ObjectMeta(size_bytes=0, backend=self.backend_type)
-
-    def _reap_loop(self) -> None:
-        while not self._stop_reaper.wait(_REAP_INTERVAL_S):
-            self.reap_expired()

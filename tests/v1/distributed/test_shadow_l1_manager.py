@@ -47,10 +47,6 @@ class Lease:
     def __init__(self) -> None:
         self.valid = True
         self.releases = 0
-        self.touches = 0
-
-    def touch(self) -> None:
-        self.touches += 1
 
     def is_valid(self) -> bool:
         return self.valid and self.releases == 0
@@ -74,7 +70,6 @@ def _view(lease: Lease) -> BorrowedTensorMemoryObj:
         ),
         lease_is_valid=lease.is_valid,
         on_release=lease.release,
-        on_touch=lease.touch,
     )
 
 
@@ -142,14 +137,18 @@ def test_admit_read_locks_without_allocating(shadow: ShadowL1Manager) -> None:
     assert shadow.reserve_read([KEY])[KEY][0] == L1Error.KEY_NOT_EXIST
 
 
-def test_duplicate_admission_releases_the_new_view(shadow: ShadowL1Manager) -> None:
+def test_resident_view_adopts_the_fresh_lease(shadow: ShadowL1Manager) -> None:
+    """A second request's lookup renews a held view: the resident object
+    stays, now under the newer lease, and the older reservation goes back."""
     first_lease, second_lease = Lease(), Lease()
     first = _view(first_lease)
     assert shadow.admit({KEY: first})[KEY] == (L1Error.SUCCESS, first)
+    first_lease.valid = False  # the first reservation ran out meanwhile
     assert shadow.admit({KEY: _view(second_lease)})[KEY] == (L1Error.SUCCESS, first)
-    assert (first_lease.releases, second_lease.releases) == (0, 1)
+    assert (first_lease.releases, second_lease.releases) == (1, 0)
+    assert shadow.unsafe_read([KEY])[KEY] == (L1Error.SUCCESS, first)
     shadow.finish_read([KEY], read_locks=2)
-    assert first_lease.releases == 1
+    assert second_lease.releases == 1
 
 
 def test_expired_view_is_not_admitted(shadow: ShadowL1Manager) -> None:
@@ -160,23 +159,19 @@ def test_expired_view_is_not_admitted(shadow: ShadowL1Manager) -> None:
     assert shadow.reserve_read([KEY])[KEY][0] == L1Error.KEY_NOT_EXIST
 
 
-def test_reaper_keeps_held_views_and_releases_unheld_ones(
+def test_holder_keeps_an_expired_view_until_finish_read(
     shadow: ShadowL1Manager,
 ) -> None:
+    """An ended lease refuses new readers but never tears the view out from
+    under its holder; the lease is released by the holder's finish_read."""
     lease = Lease()
     shadow.admit({KEY: _view(lease)})
     lease.valid = False
-    shadow.reap_expired()
-    assert lease.releases == 0
+    assert shadow.reserve_read([KEY])[KEY][0] == L1Error.KEY_NOT_EXIST
     assert shadow.unsafe_read([KEY])[KEY][0] == L1Error.KEY_NOT_READABLE
+    assert lease.releases == 0
     assert shadow.finish_read([KEY])[KEY] == L1Error.SUCCESS
     assert lease.releases == 1
-
-    other = ObjectKey(chunk_hash=b"unheld", model_name="shadow", kv_rank=0)
-    unheld = Lease()
-    shadow.admit({other: _view(unheld)})
-    shadow.finish_read([other])
-    assert unheld.releases == 1
 
 
 def test_deletion_releases_the_view(shadow: ShadowL1Manager) -> None:
@@ -214,19 +209,20 @@ def test_for_lender_rejects_a_segment_no_l1_backs(shadow: ShadowL1Manager) -> No
         ShadowL1Manager.for_lender(1, MemorySegment.VRAM, shadow.config)
 
 
-def test_reaper_collects_a_view_whose_read_ttl_lapsed(
+def test_admit_sweeps_a_view_whose_read_ttl_lapsed(
     shadow_1s: ShadowL1Manager,
 ) -> None:
     """A reader past its TTL is gone and its late finish_read is refused, so
-    the shadow's own reaper must free the view whatever the lease says, or
-    the lender's reservation stays pinned."""
+    the next admit must free the view whatever the lease says, or the
+    lender's reservation stays pinned."""
     lease = Lease()
     shadow_1s.admit({KEY: _view(lease)})
-    deadline = time.monotonic() + 5.0
-    while lease.releases == 0 and time.monotonic() < deadline:
-        time.sleep(0.1)
+    time.sleep(1.2)
+    assert shadow_1s.finish_read([KEY])[KEY] == L1Error.KEY_IN_WRONG_STATE
+    assert lease.releases == 0
+    other = ObjectKey(chunk_hash=b"next", model_name="shadow", kv_rank=0)
+    shadow_1s.admit({other: _view(Lease())})
     assert lease.releases == 1
-    assert shadow_1s.finish_read([KEY])[KEY] == L1Error.KEY_NOT_EXIST
     assert shadow_1s.unsafe_read([KEY])[KEY][0] == L1Error.KEY_NOT_EXIST
 
 
@@ -242,16 +238,3 @@ def test_admit_replaces_a_stale_unheld_view(shadow_1s: ShadowL1Manager) -> None:
     assert stale.releases == 1
     assert fresh.releases == 0
     assert shadow_1s.unsafe_read([KEY])[KEY] == (L1Error.SUCCESS, view)
-
-
-def test_touch_reaches_the_lender_of_a_valid_view(shadow: ShadowL1Manager) -> None:
-    """A reader hit is forwarded to the lender so it can renew the lease; an
-    expired or absent view is not touched."""
-    lease = Lease()
-    shadow.admit({KEY: _view(lease)})
-    other = ObjectKey(chunk_hash=b"absent", model_name="shadow", kv_rank=0)
-    shadow.touch_keys([KEY, other])
-    assert lease.touches == 1
-    lease.valid = False
-    shadow.touch_keys([KEY])
-    assert lease.touches == 1

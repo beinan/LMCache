@@ -1234,7 +1234,9 @@ class PrefetchController(StorageControllerInterface):
 
         Note:
             Locks are taken regardless of the lock mode; under ``NO_LOCK``
-            they are released when the request finishes.
+            they are released when the request finishes. A shadow L1 is never
+            a hit source here: its views belong to the requests that borrowed
+            them, and a new request borrows afresh from the lender.
         """
         flattened_keys = request.get_flattened_keys()
         num_rows = len(request.key_groups)
@@ -1246,12 +1248,9 @@ class PrefetchController(StorageControllerInterface):
                     l1_manager.get_memory_tags(), request.allowed_l1_memory_tags
                 ):
                     continue
-                if (
-                    request.lock_mode == PrefetchLockMode.NO_LOCK
-                    and l1_manager.get_memory_tags().residency is MemoryResidency.REMOTE
-                ):
-                    # A borrowed view lives only while read-locked; a warm
-                    # request's unlock could free it under its readers.
+                if l1_manager.get_memory_tags().residency is MemoryResidency.REMOTE:
+                    # A shadow L1 holds views for in-flight reads only; every
+                    # request looks the lender up, which refreshes the lease.
                     continue
                 result = l1_manager.reserve_read(flattened_keys, request.num_kv_readers)
                 res_bitmap = Bitmap(len(flattened_keys))
