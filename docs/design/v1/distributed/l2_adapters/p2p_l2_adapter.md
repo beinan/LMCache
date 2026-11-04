@@ -56,22 +56,11 @@ means, while the polling, timeout and failure handling around it stay shared:
 | Copy (`P2PL2Adapter`) | records the address; a later load copies the bytes into local L1 |
 | Lend (a follow-up subclass, e.g. GPU-direct or CXL in place) | keeps the reservation and hands L1 a borrowed view; no copy, no local capacity |
 
-The lend strategy's public hooks also live on the base, with copy-strategy
-defaults, so `L2AdapterInterface` stays untouched: borrowing is a
-peer-adapter capability, not one every L2 adapter has.
-
-| Hook | Copy default | Lending subclass |
-|---|---|---|
-| `take_borrowed_objects(task_id, keys, layouts)` | `NotImplementedError` | returns a `BorrowedTensorMemoryObj` per lendable key; never raises after creating a view |
-| `release_lookup(task_id, keys)` | `submit_unlock(keys)` | returns only the reservations no view adopted |
-| `get_active_borrow_count()` | `0` | live views that must drain before removal |
-
-A lending subclass wants a `REMOTE` L1 (`get_wanted_l1_memory_tags`), which
-makes `StorageManager` create a shadow L1 for it and the prefetch controller
-borrow from it. The controller does not import this module: it checks the
-`LendingL2Adapter` protocol (`storage_controllers/utils.py`) when the shadow
-attaches, so an adapter that wants a `REMOTE` L1 without these hooks is
-refused at registration. See
+A lending subclass also derives from `LendingL2Adapter`
+(`l2_adapters/lending.py`), which declares `take_borrowed_objects`,
+`release_lookup` and `get_active_borrow_count`. That type, not a method
+check, is what lets the storage manager give it a shadow L1; it wants a
+`REMOTE` L1 and cannot use serde, since its views are read in place. See
 [../l1_manager/l1-manager-types.md](../l1_manager/l1-manager-types.md)
 ("Shadow L1").
 

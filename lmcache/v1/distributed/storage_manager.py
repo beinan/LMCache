@@ -52,6 +52,7 @@ from lmcache.v1.distributed.l2_adapters.config import (
     L2AdapterConfigBase,
     get_type_name_for_config,
 )
+from lmcache.v1.distributed.l2_adapters.lending import LendingL2Adapter
 from lmcache.v1.distributed.l2_adapters.reconfiguration import (
     L2DeviceOwner,
     L2ReconfigurableAdapter,
@@ -1132,8 +1133,11 @@ class StorageManager:
         Raises:
             ValueError: If no L1 has the memory tags the adapter wants, the
                 adapter registers a single L1 memory region while its L1 spans
-                more than one Device-DAX arena, or a DAX device is already
-                mapped by L1 or another L2 adapter.
+                more than one Device-DAX arena, a DAX device is already
+                mapped by L1 or another L2 adapter, or a ``REMOTE``-wanting
+                adapter is not a lending one (see ``_build_l2_adapter``).
+            RuntimeError: If a controller did not attach the adapter in time.
+                The adapter is then closed and nothing stays registered.
         """
         with self._lifecycle_lock:
             # Mirror of the check in add_l1_devdax_device: a single-region
@@ -1155,31 +1159,49 @@ class StorageManager:
                     )
             self._check_dax_devices_unowned(config)
             adapter_id, adapter, descriptor = self._build_l2_adapter(config)
-            for listener in self._registered_l2_listeners:
-                adapter.register_listener(listener)
-            with self._adapters_lock:
-                self._l2_adapters[adapter_id] = adapter
-                self._adapter_descriptors[adapter_id] = descriptor
-            shadow = self._shadow_l1s.get(adapter_id)
-            if shadow is None:
-                owner = self._l1_by_tag[
-                    resolve_l1_affinity(config, self._l1_by_tag)
-                ].l1_manager_id
-                self._store_controllers[owner].add_adapter(
-                    adapter_id, adapter, descriptor
-                )
-            self._prefetch_controller.add_adapter(
-                adapter_id, adapter, descriptor, shadow_l1=shadow
-            )
-            if self._should_enable_l2_eviction(adapter, config.eviction_config):
-                assert config.eviction_config is not None  # make linter happy
-                self._l2_eviction_controller.add_adapter_state(
-                    L2AdapterEvictionState(
-                        adapter_id=adapter_id,
-                        adapter=adapter,
-                        eviction_config=config.eviction_config,
+            store_owner: int | None = None
+            try:
+                for listener in self._registered_l2_listeners:
+                    adapter.register_listener(listener)
+                with self._adapters_lock:
+                    self._l2_adapters[adapter_id] = adapter
+                    self._adapter_descriptors[adapter_id] = descriptor
+                shadow = self._shadow_l1s.get(adapter_id)
+                if shadow is None:
+                    store_owner = self._l1_by_tag[
+                        resolve_l1_affinity(config, self._l1_by_tag)
+                    ].l1_manager_id
+                    self._store_controllers[store_owner].add_adapter(
+                        adapter_id, adapter, descriptor
                     )
+                self._prefetch_controller.add_adapter(
+                    adapter_id, adapter, descriptor, shadow_l1=shadow
                 )
+                if self._should_enable_l2_eviction(adapter, config.eviction_config):
+                    assert config.eviction_config is not None  # make linter happy
+                    self._l2_eviction_controller.add_adapter_state(
+                        L2AdapterEvictionState(
+                            adapter_id=adapter_id,
+                            adapter=adapter,
+                            eviction_config=config.eviction_config,
+                        )
+                    )
+            except Exception:
+                # Leave nothing half-registered: the adapter, its shadow L1 and
+                # its store-controller entry all go.
+                logger.exception(
+                    "Adding L2 adapter %d failed; rolling back", adapter_id
+                )
+                with self._adapters_lock:
+                    self._l2_adapters.pop(adapter_id, None)
+                    self._adapter_descriptors.pop(adapter_id, None)
+                if store_owner is not None:
+                    self._store_controllers[store_owner].request_remove_adapter(
+                        adapter_id
+                    )
+                self._detach_shadow(adapter_id)
+                adapter.close()
+                raise
             logger.info("Added L2 adapter %d (%s)", adapter_id, descriptor.type_name)
             self._publish_capacity_changed()
             return adapter_id
@@ -1615,16 +1637,21 @@ class StorageManager:
             instance, and ``descriptor`` is its descriptor carrying that id.
 
         Raises:
-            ValueError: If no L1 has the memory tags the adapter wants, or
-                the adapter lends views of a segment no L1 medium backs.
+            ValueError: If no L1 has the memory tags the adapter wants; or the
+                adapter wants a ``REMOTE`` L1 but is not a
+                :class:`LendingL2Adapter`, uses serde, or borrows a segment no
+                L1 medium backs. A shadow L1 is supported only with a lending
+                adapter, whose views are read in place.
 
         Note:
-            A lending adapter (wants a ``REMOTE`` L1) maps peer memory itself;
-            it gets a shadow L1 created here, which lives as long as it does.
+            A lending adapter maps peer memory itself; it gets a shadow L1
+            created here, which lives as long as it does.
         """
+        segment = borrowed_segment(config)
+        if segment is not None and config.serde_config is not None:
+            raise ValueError("A lending L2 adapter cannot use serde")
         adapter_id = self._next_adapter_id
         self._next_adapter_id += 1
-        segment = borrowed_segment(config)
         manager: L1ManagerInterface
         if segment is None:
             manager = self._l1_by_tag[resolve_l1_affinity(config, self._l1_by_tag)]
@@ -1634,6 +1661,12 @@ class StorageManager:
             adapter: L2AdapterInterface = create_l2_adapter(
                 config, manager.get_l1_memory_desc()
             )
+            if segment is not None and not isinstance(adapter, LendingL2Adapter):
+                adapter.close()
+                raise ValueError(
+                    f"L2 adapter {adapter_id} wants a REMOTE L1 but is not a "
+                    "LendingL2Adapter; a shadow L1 is supported only with one"
+                )
         except Exception:
             if segment is not None:
                 manager.close()

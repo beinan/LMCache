@@ -37,13 +37,17 @@ from lmcache.v1.distributed.l2_adapters.mock_l2_adapter import (
     MockL2Adapter,
     MockL2AdapterConfig,
 )
+from lmcache.v1.distributed.serde.base import SerdeConfig
 from lmcache.v1.distributed.storage_controllers.store_controller import StoreController
 from lmcache.v1.distributed.storage_controllers.store_policy import (
     DefaultStorePolicy,
 )
 from lmcache.v1.distributed.storage_controllers.utils import L2AdapterDescriptor
 from lmcache.v1.distributed.storage_manager import StorageManager, l1_owners_of
-from tests.v1.distributed.lending_mock import LendingMockL2AdapterConfig
+from tests.v1.distributed.lending_mock import (
+    LendingMockL2AdapterConfig,
+    NonLendingMockL2AdapterConfig,
+)
 from tests.v1.distributed.utils import should_use_lazy_alloc
 
 if not torch_dev.is_available():
@@ -482,5 +486,52 @@ class TestStorageManagerRuntimeAdapters:
             status = sm.report_status()
             assert set(status["l1_managers"]) == {"_default"}
             assert status["num_l2_adapters"] == 0
+        finally:
+            sm.close()
+
+    def test_shadow_l1_is_refused_to_anything_but_a_lender(
+        self, empty_storage_manager_config
+    ):
+        """A REMOTE-wanting adapter that is not a LendingL2Adapter, or a lender
+        with serde, is refused before anything is registered: no adapter, no
+        shadow L1, and the next lender gets the next id."""
+        sm = StorageManager(empty_storage_manager_config)
+        try:
+            with pytest.raises(ValueError, match="not a LendingL2Adapter"):
+                sm.add_l2_adapter(
+                    NonLendingMockL2AdapterConfig(
+                        max_size_gb=0.01, mock_bandwidth_gb=10.0
+                    )
+                )
+            serde = LendingMockL2AdapterConfig(max_size_gb=0.01, mock_bandwidth_gb=10.0)
+            serde.serde_config = SerdeConfig(type="fp8")
+            with pytest.raises(ValueError, match="serde"):
+                sm.add_l2_adapter(serde)
+            status = sm.report_status()
+            assert status["num_l2_adapters"] == 0
+            assert set(status["l1_managers"]) == {"_default"}
+            adapter_id = sm.add_l2_adapter(
+                LendingMockL2AdapterConfig(max_size_gb=0.01, mock_bandwidth_gb=10.0)
+            )
+            assert f"shadow.dram.{adapter_id}" in sm.report_status()["l1_managers"]
+        finally:
+            sm.close()
+
+    def test_hot_added_lender_switches_status_to_the_multi_l1_shape(
+        self, empty_storage_manager_config
+    ):
+        """With one configured L1 the status carries the flat single-L1 fields;
+        a lender's shadow L1 makes it multi-L1 while attached."""
+        sm = StorageManager(empty_storage_manager_config)
+        try:
+            assert "l1_manager" in sm.report_status()
+            adapter_id = sm.add_l2_adapter(
+                LendingMockL2AdapterConfig(max_size_gb=0.01, mock_bandwidth_gb=10.0)
+            )
+            status = sm.report_status()
+            assert "l1_manager" not in status
+            assert len(status["l1_managers"]) == 2
+            sm.delete_l2_adapter(adapter_id)
+            assert "l1_manager" in sm.report_status()
         finally:
             sm.close()

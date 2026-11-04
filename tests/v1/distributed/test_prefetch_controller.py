@@ -2114,6 +2114,31 @@ class TestBorrowing:
             adapter.close()
             shadow.close()
 
+    def test_removal_waits_for_live_views(self, l1_manager):
+        """A lender is detached only once every view it lent is released,
+        so its memory is never unmapped under a reader."""
+        shadow, adapter = make_lender(l1_manager)
+        layout = make_layout()
+        keys = [make_object_key(i) for i in range(2)]
+        store_keys_in_l2(adapter, keys, layout)
+        ctrl = make_borrowing_controller(l1_manager, shadow, adapter)
+        ctrl.start()
+        try:
+            result = wait_for_result(
+                ctrl, ctrl.submit_prefetch_request(single_row_spec(keys))
+            )
+            assert row_bits(result) == [0, 1]
+            done = ctrl.request_remove_adapter(0)
+            assert not done.wait(timeout=1.0)
+            assert adapter.get_active_borrow_count() == 2
+            shadow.finish_read(keys)
+            assert done.wait(timeout=5.0)
+            assert adapter.get_active_borrow_count() == 0
+        finally:
+            ctrl.stop()
+            adapter.close()
+            shadow.close()
+
     def test_lent_views_are_admitted_into_the_shadow_l1(self, l1_manager):
         """Borrowed keys hit without allocating in any L1, and their lease
         holds the L2 lock until the last reader finishes."""

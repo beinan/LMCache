@@ -46,6 +46,7 @@ from lmcache.v1.distributed.error import L1Error
 from lmcache.v1.distributed.internal_api import L1ManagerInterface
 from lmcache.v1.distributed.l1_manager import ShadowL1Manager
 from lmcache.v1.distributed.l2_adapters.base import L2AdapterInterface, L2TaskId
+from lmcache.v1.distributed.l2_adapters.lending import LendingL2Adapter
 from lmcache.v1.distributed.storage_controller import StorageControllerInterface
 from lmcache.v1.distributed.storage_controllers.adapter_lifecycle import (
     AddAdapterOp,
@@ -59,7 +60,6 @@ from lmcache.v1.distributed.storage_controllers.utils import (
     Bitmap2D,
     L1ManagerDescriptor,
     L2AdapterDescriptor,
-    LendingL2Adapter,
     MapState,
     borrowed_segment,
     resolve_l1_affinity,
@@ -476,10 +476,11 @@ class InFlightPrefetchRequest:
 
 
 def _require_lender(adapter_id: int, adapter: L2AdapterInterface) -> LendingL2Adapter:
-    """Return ``adapter`` as a lender; raise ValueError if it lacks the hooks."""
+    """Return ``adapter`` as a lender; raise ValueError if it is not one."""
     if not isinstance(adapter, LendingL2Adapter):
         raise ValueError(
-            f"L2 adapter {adapter_id} brought a shadow L1 but does not lend views"
+            f"L2 adapter {adapter_id} brought a shadow L1 but does not lend views "
+            "(not a LendingL2Adapter)"
         )
     return adapter
 

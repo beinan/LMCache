@@ -951,7 +951,8 @@ class BorrowedTensorMemoryObj(TensorMemoryObj):
             must never call back into an L1 manager.
         on_touch: Optional; called when a reader hits the view, so the lender
             can renew a lease that is near its end. Same rules as
-            ``on_release``.
+            ``on_release``; it may also run after :meth:`release` and must
+            then do nothing.
     """
 
     def __init__(

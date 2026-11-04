@@ -50,7 +50,8 @@ class ShadowL1Manager(BaseL1Manager):
 
     A view whose lease ended is never handed to a new reader. A reader that
     already holds it keeps it until its last ``finish_read`` (views are
-    temporary), so a copy in flight is never torn down.
+    temporary), so a copy in flight is never torn down within its read-lock
+    TTL; past the TTL the reader counts as gone, as in every L1.
     """
 
     def __init__(
@@ -208,12 +209,13 @@ class ShadowL1Manager(BaseL1Manager):
         )
         return ret
 
-    @l1_mgr_synchronized
     def touch_keys(self, keys: list[ObjectKey]) -> None:
         """Report the hits as usual, and tell each valid view's lender.
 
         A lender renews a lease that is near its end on a touch; otherwise a
         hot view would die after one owner TTL however often it is read.
+        Lock-free like the base, on the retrieve hot path, so a touch may
+        race with the view's release; ``on_touch`` must then be a no-op.
 
         Args:
             keys: The keys a reader hit.

@@ -133,6 +133,9 @@ Status and Prometheus
   ``dram``, ``devdax``, and ``gds``. Draining Device-DAX arenas are excluded.
 
 The legacy singular status fields remain available when there is one manager.
+A lending L2 adapter attaches a shadow L1 of borrowed views, which counts as a
+second manager: adding one at runtime switches the status to the per-tag
+shape until the adapter is deleted.
 ``GET /config`` includes every L1 configuration.
 
 Prometheus exports ``lmcache_mp_l1_memory_usage_bytes``,

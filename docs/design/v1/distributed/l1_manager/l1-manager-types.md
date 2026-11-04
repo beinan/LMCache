@@ -125,11 +125,14 @@ lending L2 adapter                         ShadowL1Manager (metadata only)
   adapter's L1 affinity. When the adapter is deleted, the controller detaches
   it only once its views drained, and the storage manager then closes the
   shadow. One lender, one shadow: a DRAM lender and a CXL lender each bring
-  their own, and no local L1 of that medium is needed. The lending hooks
-  (`take_borrowed_objects`, `release_lookup`, `get_active_borrow_count`)
-  are on `PeerL2AdapterBase`, not on `L2AdapterInterface`; the controller
-  checks them structurally (`LendingL2Adapter` protocol) when the shadow
-  attaches, so a lender without them fails at registration.
+  their own, and no local L1 of that medium is needed. A shadow L1 is
+  supported only with a `LendingL2Adapter` (`l2_adapters/lending.py`, the
+  three hooks; in production a lending peer adapter): the storage manager
+  refuses a `REMOTE`-wanting adapter that is not one, or that uses serde,
+  before registering anything, and rolls back a registration that fails
+  later. Attaching a shadow makes `is_multi_l1` true, so a single-L1
+  deployment that hot-adds its first lender switches to the per-tag status
+  shape and owner-routed read completion while running.
 - **No payload.** Its memory manager refuses `allocate`, and the write policy
   never places writes on it. It has no store controller.
 - **No eviction.** `StorageManager` starts no eviction controller for it.

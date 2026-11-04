@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """A mock L2 adapter that lends views; importing registers ``lending_mock``.
 
-It satisfies the ``LendingL2Adapter`` protocol without being a
-``PeerL2AdapterBase``, so controller tests need no transport.
+It is a ``LendingL2Adapter`` without being a ``PeerL2AdapterBase``, so
+controller tests need no transport. ``NonLendingMockL2AdapterConfig``
+(``nonlending_mock``) wants a ``REMOTE`` L1 but builds a plain mock, to test
+that a shadow L1 is refused to anything but a lender.
 """
 
 # Standard
@@ -23,6 +25,7 @@ from lmcache.v1.distributed.l2_adapters.config import (
     register_l2_adapter_type,
 )
 from lmcache.v1.distributed.l2_adapters.factory import register_l2_adapter_factory
+from lmcache.v1.distributed.l2_adapters.lending import LendingL2Adapter
 from lmcache.v1.distributed.l2_adapters.mock_l2_adapter import (
     MockL2Adapter,
     MockL2AdapterConfig,
@@ -41,7 +44,11 @@ class LendingMockL2AdapterConfig(MockL2AdapterConfig):
         return (MemoryTags(MemorySegment.DRAM, MemoryResidency.REMOTE),)
 
 
-class LendingMockL2Adapter(MockL2Adapter):
+class NonLendingMockL2AdapterConfig(LendingMockL2AdapterConfig):
+    """Wants a REMOTE L1 like a lender, but its adapter cannot lend."""
+
+
+class LendingMockL2Adapter(MockL2Adapter, LendingL2Adapter):
     """Mock adapter that lends views of its stored objects .
 
     A view's lease is the key's lookup lock: ending it unlocks the key.
@@ -114,5 +121,15 @@ def _create_lending_mock_adapter(
     return LendingMockL2Adapter(config)  # type: ignore[arg-type]
 
 
+def _create_nonlending_mock_adapter(
+    config: L2AdapterConfigBase,
+    l1_memory_desc: Optional[L1MemoryDesc] = None,
+) -> L2AdapterInterface:
+    """Create a plain MockL2Adapter from a REMOTE-wanting config."""
+    return MockL2Adapter(config)  # type: ignore[arg-type]
+
+
 register_l2_adapter_type("lending_mock", LendingMockL2AdapterConfig)
 register_l2_adapter_factory("lending_mock", _create_lending_mock_adapter)
+register_l2_adapter_type("nonlending_mock", NonLendingMockL2AdapterConfig)
+register_l2_adapter_factory("nonlending_mock", _create_nonlending_mock_adapter)
