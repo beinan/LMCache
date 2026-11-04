@@ -46,6 +46,7 @@ from lmcache.v1.distributed.storage_controllers.utils import L2AdapterDescriptor
 from lmcache.v1.distributed.storage_manager import StorageManager, l1_owners_of
 from tests.v1.distributed.lending_mock import (
     LendingMockL2AdapterConfig,
+    LocalFirstLendingMockL2AdapterConfig,
     NonLendingMockL2AdapterConfig,
 )
 from tests.v1.distributed.utils import should_use_lazy_alloc
@@ -490,9 +491,10 @@ class TestStorageManagerRuntimeAdapters:
     def test_shadow_l1_is_refused_to_anything_but_a_lender(
         self, empty_storage_manager_config
     ):
-        """A REMOTE-wanting adapter that is not a LendingPeerL2AdapterBase, or a lender
-        with serde, is refused before anything is registered: no adapter, no
-        shadow L1, and the next lender gets the next id."""
+        """A REMOTE-wanting adapter that is not a LendingPeerL2AdapterBase, a
+        lender with serde, or a lender that does not want a REMOTE L1 first is
+        refused before anything is registered: no adapter, no shadow L1, and
+        the next lender gets the next id."""
         sm = StorageManager(empty_storage_manager_config)
         try:
             with pytest.raises(ValueError, match="not a LendingPeerL2AdapterBase"):
@@ -505,6 +507,10 @@ class TestStorageManagerRuntimeAdapters:
             serde.serde_config = SerdeConfig(type="fp8")
             with pytest.raises(ValueError, match="serde"):
                 sm.add_l2_adapter(serde)
+            # The opposite mismatch: a lender that wants a LOCAL L1 first must
+            # not get the owned DRAM L1 bound, listed and closed as its shadow.
+            with pytest.raises(ValueError, match="does not want a REMOTE"):
+                sm.add_l2_adapter(LocalFirstLendingMockL2AdapterConfig())
             status = sm.report_status()
             assert status["num_l2_adapters"] == 0
             assert set(status["l1_managers"]) == {"_default"}

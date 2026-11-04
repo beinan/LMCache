@@ -22,11 +22,30 @@ class ShadowL1MemoryManager:
     def allocate(
         self, layout_desc: MemoryLayoutDesc, count: int
     ) -> tuple[L1Error, list[MemoryObj]]:
-        """Refuse every allocation (``(OUT_OF_MEMORY, [])``); views are admitted."""
+        """Refuse every allocation; views enter through ``ShadowL1Manager.admit``.
+
+        Args:
+            layout_desc: Ignored.
+            count: Ignored.
+
+        Returns:
+            ``(OUT_OF_MEMORY, [])``, always.
+        """
         return L1Error.OUT_OF_MEMORY, []
 
     def free(self, mem_objs: list[MemoryObj]) -> L1Error:
-        """End each view's lease and return ``SUCCESS``; TypeError for anything else."""
+        """End each view's lease.
+
+        Args:
+            mem_objs: Borrowed views to release.
+
+        Returns:
+            ``SUCCESS``.
+
+        Raises:
+            TypeError: If an object is not a :class:`BorrowedTensorMemoryObj`,
+                which would mean a wiring bug placed local memory here.
+        """
         for obj in mem_objs:
             if not isinstance(obj, BorrowedTensorMemoryObj):
                 raise TypeError(f"Shadow L1 holds only borrowed views, got {obj!r}")

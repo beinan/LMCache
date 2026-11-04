@@ -26,7 +26,6 @@ from lmcache.v1.distributed.l1_manager.base import (
     l1_mgr_synchronized,
     validate_read_locks,
 )
-from lmcache.v1.distributed.l2_adapters.config import L2AdapterConfigBase
 from lmcache.v1.distributed.memory_manager import (
     BorrowedTensorMemoryObj,
     ShadowL1MemoryManager,
@@ -42,17 +41,9 @@ _BACKEND_BY_SEGMENT: dict[MemorySegment, L1BackendType] = {
     MemorySegment.GDS: L1BackendType.GDS,
 }
 
-# How often a shadow frees the views whose readers' TTL lapsed.
+# How often a shadow's reaper thread (one per lender) frees the views whose
+# readers' TTL lapsed.
 _REAP_INTERVAL_S = 0.5
-
-
-def borrowed_segment(adapter_config: L2AdapterConfigBase) -> MemorySegment | None:
-    """Return the segment a lender borrows views of (it wants a ``REMOTE`` L1
-    first), or None for an adapter that copies into ``LOCAL`` buffers."""
-    wanted = adapter_config.get_wanted_l1_memory_tags()
-    if wanted and wanted[0].residency is MemoryResidency.REMOTE:
-        return wanted[0].segment
-    return None
 
 
 class ShadowL1Manager(BaseL1Manager):

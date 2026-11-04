@@ -44,7 +44,6 @@ from lmcache.v1.distributed.internal_api import (
 from lmcache.v1.distributed.l1_manager import (
     DevDaxL1Manager,
     ShadowL1Manager,
-    borrowed_segment,
     create_l1_managers,
 )
 from lmcache.v1.distributed.l2_adapters import create_l2_adapter
@@ -55,6 +54,7 @@ from lmcache.v1.distributed.l2_adapters.config import (
 )
 from lmcache.v1.distributed.l2_adapters.p2p_l2_adapter import (
     LendingPeerL2AdapterBase,
+    borrowed_segment,
 )
 from lmcache.v1.distributed.l2_adapters.reconfiguration import (
     L2DeviceOwner,
@@ -103,6 +103,9 @@ from lmcache.v1.mp_observability.trace.decorator import (
 from lmcache.v1.platform import HAS_EVENTFD
 
 logger = init_logger(__name__)
+
+# How long a failed add_l2_adapter waits for the controllers to drop the adapter.
+_ROLLBACK_DRAIN_TIMEOUT_S = 30.0
 
 # L1 write tag for every object reserved through this manager. Sharing one
 # tag makes concurrent stores of the same key exclude each other.
@@ -1173,18 +1176,29 @@ class StorageManager:
                         )
                     )
             except Exception:
-                # Leave nothing half-registered: the adapter, its shadow L1 and
-                # its store-controller entry all go.
+                # Leave nothing half-registered: both controllers drop the
+                # adapter (a queued add applies first, then the remove), and
+                # only then are the adapter and its shadow L1 closed.
                 logger.exception(
                     "Adding L2 adapter %d failed; rolling back", adapter_id
                 )
                 with self._adapters_lock:
                     self._l2_adapters.pop(adapter_id, None)
                     self._adapter_descriptors.pop(adapter_id, None)
+                drained = [self._prefetch_controller.request_remove_adapter(adapter_id)]
                 if store_owner is not None:
-                    self._store_controllers[store_owner].request_remove_adapter(
-                        adapter_id
+                    drained.append(
+                        self._store_controllers[store_owner].request_remove_adapter(
+                            adapter_id
+                        )
                     )
+                for done in drained:
+                    if not done.wait(timeout=_ROLLBACK_DRAIN_TIMEOUT_S):
+                        logger.warning(
+                            "L2 adapter %d not drained within %.0fs during rollback",
+                            adapter_id,
+                            _ROLLBACK_DRAIN_TIMEOUT_S,
+                        )
                 self._detach_shadow(adapter_id)
                 adapter.close()
                 raise
@@ -1620,8 +1634,9 @@ class StorageManager:
         Raises:
             ValueError: If no L1 has the memory tags the adapter wants; or the
                 adapter wants a ``REMOTE`` L1 but is not a
-                :class:`LendingPeerL2AdapterBase`, uses serde, or borrows a
-                segment no L1 medium backs.
+                :class:`LendingPeerL2AdapterBase`, or is one but does not want
+                a ``REMOTE`` L1 first, uses serde, or borrows a segment no L1
+                medium backs.
 
         Note:
             A lending adapter maps peer memory itself; it gets a shadow L1
@@ -1641,13 +1656,18 @@ class StorageManager:
             adapter: L2AdapterInterface = create_l2_adapter(
                 config, manager.get_l1_memory_desc()
             )
-            if segment is not None and not isinstance(
-                adapter, LendingPeerL2AdapterBase
-            ):
+            lends = isinstance(adapter, LendingPeerL2AdapterBase)
+            if lends != (segment is not None):
                 adapter.close()
                 raise ValueError(
-                    f"L2 adapter {adapter_id} wants a REMOTE L1 but is not a "
-                    "LendingPeerL2AdapterBase; a shadow L1 is supported only with one"
+                    f"L2 adapter {adapter_id} "
+                    + (
+                        "is a LendingPeerL2AdapterBase but does not want a REMOTE "
+                        "L1 first"
+                        if lends
+                        else "wants a REMOTE L1 but is not a LendingPeerL2AdapterBase"
+                    )
+                    + "; a shadow L1 is supported only with one"
                 )
         except Exception:
             if segment is not None:

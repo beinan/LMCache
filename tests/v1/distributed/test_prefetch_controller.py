@@ -2111,6 +2111,35 @@ class TestBorrowing:
             ctrl.stop()
             adapter.close()
 
+    def test_concurrent_borrows_of_one_key_both_hit(self, l1_manager):
+        """Two LOCK prefetches whose lookups of one hot key are outstanding
+        together both hit: the second request is admitted while the first is
+        still looking up (a shadow L1 has no capacity to gate on), and the
+        first borrower's unlock must not return the second one's reservation.
+        The resident view then serves both readers under one peer lock."""
+        shadow, adapter = make_lender(l1_manager)
+        key = make_object_key(0)
+        store_keys_in_l2(adapter, [key], make_layout())
+        ctrl = make_borrowing_controller(l1_manager, adapter)
+        ctrl.start()
+        try:
+            adapter.hold_lookups = True
+            first = ctrl.submit_prefetch_request(single_row_spec([key]))
+            second = ctrl.submit_prefetch_request(single_row_spec([key]))
+            deadline = time.monotonic() + 5.0
+            while adapter.lookup_count < 2 and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert adapter.lookup_count == 2
+            adapter.release_lookups()
+            results = [wait_for_result(ctrl, first), wait_for_result(ctrl, second)]
+            assert [row_bits(r) for r in results] == [[0], [0]]
+            assert adapter.debug_get_locked_key_count() == 1
+            assert shadow.finish_read([key], read_locks=2)[key] == L1Error.SUCCESS
+            assert_l2_unlocked(adapter)
+        finally:
+            ctrl.stop()
+            adapter.close()
+
     def test_warm_prefetch_skips_lender_and_shadow_l1(self, l1_manager):
         """A NO_LOCK prefetch neither looks up a lender (a borrowed view cannot
         outlive its read locks, so it would be a false hit) nor a shadow L1 (a

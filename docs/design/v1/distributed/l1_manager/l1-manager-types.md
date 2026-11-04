@@ -125,8 +125,8 @@ lender ── take_borrowed_objects ──► views ── admit ──► shado
 - **A view lives only while held.** `admit` indexes and read-locks each view;
   a resident valid view wins over a duplicate, a stale unheld one is replaced.
   An ended lease refuses new readers while a holder keeps its view until
-  `finish_read`. The shadow's own reaper thread frees every unheld view,
-  lease or not: after a read-lock TTL lapses nothing else would.
+  `finish_read`. The shadow's own reaper thread (one per lender) frees every
+  unheld view, lease or not: after a read-lock TTL lapses nothing else would.
 - **Reads renew.** Every hit reaches the view's `on_touch`, lock-free, so the
   lender can extend the lease. A hot view lives as long as it is read.
 - **Only `LOCK` prefetches borrow.** A warm (`NO_LOCK`) request skips lenders

@@ -77,6 +77,23 @@ class _LoadTask:
     failed: bool = False
 
 
+def borrowed_segment(adapter_config: L2AdapterConfigBase) -> MemorySegment | None:
+    """Return the segment a lending adapter borrows views of.
+
+    Args:
+        adapter_config: Any L2 adapter config.
+
+    Returns:
+        The segment of the first wanted L1 tag when its residency is
+        ``REMOTE``, which marks a lender (:class:`LendingPeerL2AdapterBase`);
+        None for an adapter that copies into ``LOCAL`` buffers.
+    """
+    wanted = adapter_config.get_wanted_l1_memory_tags()
+    if wanted and wanted[0].residency is MemoryResidency.REMOTE:
+        return wanted[0].segment
+    return None
+
+
 class PeerL2AdapterConfigBase(L2AdapterConfigBase):
     """Fields shared by every adapter that looks up and locks keys on one peer.
 
@@ -407,9 +424,8 @@ class LendingPeerL2AdapterBase(PeerL2AdapterBase):
 
     A lookup hit reserves the key at the peer. A reservation that
     :meth:`take_borrowed_objects` moves into a view belongs to the view and
-    ends with its release; ``submit_unlock`` must return only reservations
-    that were not moved, so the controller unlocks every planned key without
-    knowing which were lent.
+    ends with its release; the controller returns the others with the usual
+    ``submit_unlock``, which never names a key that became a view.
     """
 
     def __init__(self, config: PeerL2AdapterConfigBase) -> None:
@@ -422,8 +438,12 @@ class LendingPeerL2AdapterBase(PeerL2AdapterBase):
         return self._shadow_l1
 
     def bind_shadow_l1(self, shadow: "ShadowL1Manager") -> None:
-        """Take ownership of the shadow L1 the storage manager created for this
-        adapter; :meth:`close` closes it."""
+        """Take ownership of the shadow L1 created for this adapter.
+
+        Args:
+            shadow: The shadow L1 the storage manager created with
+                ``ShadowL1Manager.for_lender``; :meth:`close` closes it.
+        """
         self._shadow_l1 = shadow
 
     def close(self) -> None:
@@ -446,8 +466,9 @@ class LendingPeerL2AdapterBase(PeerL2AdapterBase):
             layouts: Expected layout by object-group ID.
 
         Returns:
-            A borrowed view per key it can lend. A key it cannot lend is
-            omitted and its reservation stays returnable by ``submit_unlock``.
+            A borrowed view per key it holds a reservation for; the view now
+            owns that reservation. A key it cannot lend is omitted, and the
+            caller returns its reservation with ``submit_unlock``.
 
         Note:
             Must not raise once it has created a view: a view that never

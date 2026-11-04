@@ -179,8 +179,9 @@ ownership, and serialized completion.
 configurations; `create_l1_manager` turns each into a `DramL1Manager`,
 `DevDaxL1Manager` or `GdsL1Manager`. The legacy singular config aliases the
 first entry. Each configured manager owns its allocator, eviction controller,
-and store controller; a shadow L1 has none. Initialization and a failed
-`add_l2_adapter` roll back whatever they already created.
+and store controller; a shadow L1 has none. Initialization rolls back what it
+already created; a failed `add_l2_adapter` has both controllers drop the
+adapter, then closes it and its shadow.
 
 L2 affinity is resolved from memory tags (see `memory_tags.md`): each adapter's
 config lists the L1 memory tags it wants, most preferred first, and

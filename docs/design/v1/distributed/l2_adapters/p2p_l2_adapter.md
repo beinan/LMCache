@@ -59,10 +59,11 @@ means, while the polling, timeout and failure handling around it stay shared:
 
 `LendingPeerL2AdapterBase` is abstract and adds `take_borrowed_objects` and
 `get_active_borrow_count`; a reservation moved into a view belongs to the view,
-so its `submit_unlock` must skip lent keys. Being that type is what earns an
-adapter a shadow L1, bound with `bind_shadow_l1` and closed with the adapter
-(`../l1_manager/l1-manager-types.md`, "Shadow L1"). It cannot use serde: its
-views are read in place.
+and the controller unlocks only the keys that did not become views. Being that
+type, with a config that wants a `REMOTE` L1 first (`borrowed_segment`), is
+what earns an adapter a shadow L1, bound with `bind_shadow_l1` and closed with
+the adapter (`../l1_manager/l1-manager-types.md`, "Shadow L1"). It cannot use
+serde: its views are read in place.
 
 ## Lifecycle
 

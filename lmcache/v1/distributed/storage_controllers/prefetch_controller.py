@@ -1148,10 +1148,12 @@ class PrefetchController(StorageControllerInterface):
             for request in self._in_flight_requests.values()
             if request.phase == PrefetchPhase.LOOKUP
         )
+        # A lender's shadow L1 has no capacity to protect: views cost no
+        # local bytes, so it never gates admission.
         target_l1_indices = {
             self._l2_affinity[adapter_idx]
             for adapter_idx in self._l2_adapters
-            if adapter_idx not in self._draining
+            if adapter_idx not in self._draining and adapter_idx not in self._shadow_l1s
         }
         for l1_idx in target_l1_indices:
             l1_manager = self._l1_managers[l1_idx]
@@ -1600,9 +1602,9 @@ class PrefetchController(StorageControllerInterface):
 
         A lender copies nothing: the views it hands over are admitted into
         its shadow L1, read-locked for the request, and leave the L2 plan
-        without reserving destination capacity. ``submit_unlock`` then
-        returns the reservations that did not become views; the views own
-        theirs.
+        without reserving destination capacity. Only keys that did not
+        become views are unlocked; a view owns its reservation, so another
+        request's reservation of the same key is never returned here.
         """
         states = request.key_states
         layouts = {
@@ -1614,19 +1616,17 @@ class PrefetchController(StorageControllerInterface):
                 continue
             lender = cast(LendingPeerL2AdapterBase, self._l2_adapters[adapter_idx])
             keys = _gather_keys(request.key_groups, cells)
+            views = lender.take_borrowed_objects(keys, layouts)
             admitted = Bitmap(len(keys))
             try:
                 # admit releases every view it does not keep; a lender never
                 # raises after creating a view, so admit sees all of them.
-                results = shadow.admit(
-                    lender.take_borrowed_objects(keys, layouts),
-                    read_locks=request.num_kv_readers,
-                )
+                results = shadow.admit(views, read_locks=request.num_kv_readers)
                 for i, key in enumerate(keys):
                     if key in results and results[key][0] == L1Error.SUCCESS:
                         admitted.set(i)
             finally:
-                lender.submit_unlock(keys)
+                lender.submit_unlock([key for key in keys if key not in views])
                 loaded = _scatter_bitmaps(cells, admitted)
                 l1_idx = shadow.l1_manager_id
                 if l1_idx in states.l1_locked_keys:

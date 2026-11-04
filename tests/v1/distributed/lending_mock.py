@@ -62,6 +62,13 @@ class NonLendingMockL2AdapterConfig(MockL2AdapterConfig):
         return (MemoryTags(MemorySegment.DRAM, MemoryResidency.REMOTE),)
 
 
+class LocalFirstLendingMockL2AdapterConfig(LendingMockL2AdapterConfig):
+    """A lender's config that forgot to want a REMOTE L1 first."""
+
+    def get_wanted_l1_memory_tags(self) -> tuple[MemoryTags, ...]:
+        return (MemoryTags(MemorySegment.DRAM, MemoryResidency.LOCAL),)
+
+
 class _Future:
     def __init__(self, value: object) -> None:
         self._value = value
@@ -120,6 +127,9 @@ class LendingMockL2Adapter(LendingPeerL2AdapterBase):
         self._live_views = 0
         self.lookup_count = 0
         self.touch_count = 0
+        # While set, lookup results are withheld so several requests can have
+        # lookups of the same key outstanding at once.
+        self.hold_lookups = False
         with (
             patch.object(
                 p2p_mod.RequestClientFactory, "create", return_value=self._owner
@@ -156,6 +166,16 @@ class LendingMockL2Adapter(LendingPeerL2AdapterBase):
         self._lookup_efd.notify()
         return task_id
 
+    def query_lookup_and_lock_result(self, task_id: L2TaskId) -> Bitmap | None:
+        if self.hold_lookups:
+            return None
+        return super().query_lookup_and_lock_result(task_id)
+
+    def release_lookups(self) -> None:
+        """Stop withholding lookup results and wake the prefetch loop."""
+        self.hold_lookups = False
+        self._lookup_efd.notify()
+
     def _process_lookup_result(
         self, keys: list[ObjectKey], addresses: list[TransferChannelAddress]
     ) -> Bitmap:
@@ -167,13 +187,10 @@ class LendingMockL2Adapter(LendingPeerL2AdapterBase):
         return bitmap
 
     def submit_unlock(self, keys: list[ObjectKey]) -> None:
-        """Return the reservations no view consumed; a lent key is its view's."""
-        returned = []
+        """Return one reservation per key; the controller never names a lent key."""
         for key in keys:
-            if self._reserved.get(key, 0):
-                self._reserved[key] -= 1
-                returned.append(key)
-        super().submit_unlock(returned)
+            self._reserved[key] -= 1
+        super().submit_unlock(keys)
 
     # -- lending ------------------------------------------------------------
 
@@ -251,3 +268,7 @@ register_l2_adapter_type("lending_mock", LendingMockL2AdapterConfig)
 register_l2_adapter_factory("lending_mock", _create_lending_mock_adapter)
 register_l2_adapter_type("nonlending_mock", NonLendingMockL2AdapterConfig)
 register_l2_adapter_factory("nonlending_mock", _create_nonlending_mock_adapter)
+register_l2_adapter_type(
+    "localfirst_lending_mock", LocalFirstLendingMockL2AdapterConfig
+)
+register_l2_adapter_factory("localfirst_lending_mock", _create_lending_mock_adapter)
