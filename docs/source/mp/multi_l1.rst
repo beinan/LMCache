@@ -133,8 +133,6 @@ Status and Prometheus
   ``dram``, ``devdax``, and ``gds``. Draining Device-DAX arenas are excluded.
 
 The legacy singular status fields remain available when there is one manager.
-A lending L2 adapter's shadow L1 counts as a manager: adding one at runtime
-switches the status to the per-tag shape until the adapter is deleted.
 ``GET /config`` includes every L1 configuration.
 
 Prometheus exports ``lmcache_mp_l1_memory_usage_bytes``,
@@ -154,8 +152,7 @@ with that registration. This limit permits every profile listed above.
 A successful cuFile compatibility-mode transfer does not establish native
 GPUDirect DMA support; check the deployment's driver and filesystem.
 
-Configured L1 topology is fixed at startup; a lending L2 adapter's shadow L1
-comes and goes with the adapter. The legacy single-region descriptor,
+L1 topology is fixed at startup. The legacy single-region descriptor,
 shared-memory transfer channel, P2P registration, and Device-DAX hotplug API
 require a single compatible L1. Multi-L1 GPU serving uses the existing
 LMCache-driven IPC transfer path. Hybrid models additionally require their
