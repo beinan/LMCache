@@ -5,6 +5,7 @@
 from collections.abc import Mapping
 from dataclasses import replace
 from typing import cast
+import threading
 
 # First Party
 from lmcache import torch_dev
@@ -25,8 +26,12 @@ from lmcache.v1.distributed.l1_manager.base import (
     l1_mgr_synchronized,
     validate_read_locks,
 )
-from lmcache.v1.distributed.memory_manager import ShadowL1MemoryManager
-from lmcache.v1.memory_management import BorrowedTensorMemoryObj, MemoryObj
+from lmcache.v1.distributed.l2_adapters.config import L2AdapterConfigBase
+from lmcache.v1.distributed.memory_manager import (
+    BorrowedTensorMemoryObj,
+    ShadowL1MemoryManager,
+)
+from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.mp_observability.event import Event, EventType
 
 # The L1 medium a borrowed segment is reported as; other segments cannot be
@@ -36,6 +41,18 @@ _BACKEND_BY_SEGMENT: dict[MemorySegment, L1BackendType] = {
     MemorySegment.CXL: L1BackendType.DEVDAX,
     MemorySegment.GDS: L1BackendType.GDS,
 }
+
+# How often a shadow frees the views whose readers' TTL lapsed.
+_REAP_INTERVAL_S = 0.5
+
+
+def borrowed_segment(adapter_config: L2AdapterConfigBase) -> MemorySegment | None:
+    """Return the segment a lender borrows views of (it wants a ``REMOTE`` L1
+    first), or None for an adapter that copies into ``LOCAL`` buffers."""
+    wanted = adapter_config.get_wanted_l1_memory_tags()
+    if wanted and wanted[0].residency is MemoryResidency.REMOTE:
+        return wanted[0].segment
+    return None
 
 
 class ShadowL1Manager(BaseL1Manager):
@@ -51,7 +68,8 @@ class ShadowL1Manager(BaseL1Manager):
     A view whose lease ended is never handed to a new reader. A reader that
     already holds it keeps it until its last ``finish_read`` (views are
     temporary), so a copy in flight is never torn down within its read-lock
-    TTL; past the TTL the reader counts as gone, as in every L1.
+    TTL; past the TTL the reader counts as gone, as in every L1, and the
+    manager's own reaper thread frees the view.
     """
 
     def __init__(
@@ -73,6 +91,11 @@ class ShadowL1Manager(BaseL1Manager):
             segment=segment, residency=MemoryResidency.REMOTE
         )
         super().__init__(config, ShadowL1MemoryManager())
+        self._stop_reaper = threading.Event()
+        self._reaper = threading.Thread(
+            target=self._reap_loop, name=f"shadow-reaper-{config.tag}", daemon=True
+        )
+        self._reaper.start()
 
     @classmethod
     def for_lender(
@@ -280,18 +303,24 @@ class ShadowL1Manager(BaseL1Manager):
             objs = [self._objects.pop(key).memory_obj for key in expired]
             self._free_and_report_deleted(expired, objs)
 
-    def release_all(self) -> None:
-        """Release every view, read-locked or not, before lenders shut down.
+    def close(self) -> None:
+        """Stop the reaper and release every view, read-locked or not.
 
-        Call after stopping new controller and GPU submissions; outstanding
-        work on every device is synchronized first so no copy reads a
-        released view.
+        Idempotent. Call after stopping new controller and GPU submissions;
+        outstanding work on every device is synchronized first so no copy
+        reads a released view.
         """
+        self._stop_reaper.set()
+        self._reaper.join()
         if torch_dev.is_available():
             for device in range(torch_dev.device_count()):
                 torch_dev.synchronize(device)
-        self.clear(force=True)
+        super().close()
 
     def _object_meta(self, memory_obj: MemoryObj) -> L1ObjectMeta:
         """Report borrowed views as holding no local bytes."""
         return L1ObjectMeta(size_bytes=0, backend=self.backend_type)
+
+    def _reap_loop(self) -> None:
+        while not self._stop_reaper.wait(_REAP_INTERVAL_S):
+            self.reap_expired()

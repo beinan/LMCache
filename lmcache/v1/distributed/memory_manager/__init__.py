@@ -10,6 +10,9 @@ Two interchangeable tiers behind :class:`L1MemoryManagerProtocol`:
 """
 
 # First Party
+from lmcache.v1.distributed.memory_manager.borrowed_memory_obj import (
+    BorrowedTensorMemoryObj,
+)
 from lmcache.v1.distributed.memory_manager.devdax_l1_memory_manager import (
     DevDaxL1MemoryManager,
 )
@@ -28,6 +31,7 @@ from lmcache.v1.distributed.memory_manager.shadow_l1_memory_manager import (
 )
 
 __all__ = [
+    "BorrowedTensorMemoryObj",
     "DevDaxL1MemoryManager",
     "GDSL1MemoryManager",
     "L1MemoryManagerProtocol",

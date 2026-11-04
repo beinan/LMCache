@@ -116,17 +116,17 @@ lender ── take_borrowed_objects ──► views ── admit ──► shado
 - **It comes with the lender.** A lender wants a `REMOTE` L1 and maps peer
   memory itself, like P2P, so there is nothing to configure. `StorageManager`
   creates `ShadowL1Manager.for_lender(adapter_id, segment, defaults)` (tag
-  `shadow.<segment>.<adapter_id>`) when the adapter is added and closes it,
-  after the lender has drained its views, when the adapter is removed. Serde
-  on a lender, or a `REMOTE`-wanting adapter that is not a lender, is refused
-  before anything is registered.
+  `shadow.<segment>.<adapter_id>`) when the adapter is added and binds it to
+  the adapter (`bind_shadow_l1`), which closes it with itself once its views
+  have drained. Serde on a lender, or a `REMOTE`-wanting adapter that is not
+  a lender, is refused before anything is registered.
 - **Nothing is written, stored or evicted here.** The peer owns and evicts
   the bytes. A view leaves with its last reader, the reaper, or the adapter.
 - **A view lives only while held.** `admit` indexes and read-locks each view;
   a resident valid view wins over a duplicate, a stale unheld one is replaced.
   An ended lease refuses new readers while a holder keeps its view until
-  `finish_read`. `reap_expired` frees every unheld view, lease or not: after a
-  read-lock TTL lapses nothing else would.
+  `finish_read`. The shadow's own reaper thread frees every unheld view,
+  lease or not: after a read-lock TTL lapses nothing else would.
 - **Reads renew.** Every hit reaches the view's `on_touch`, lock-free, so the
   lender can extend the lease. A hot view lives as long as it is read.
 - **Only `LOCK` prefetches borrow.** A warm (`NO_LOCK`) request skips lenders

@@ -27,12 +27,11 @@ from lmcache.v1.distributed.l1_manager import (
     DramL1Manager,
     ShadowL1Manager,
 )
-from lmcache.v1.distributed.memory_manager import ShadowL1MemoryManager
-from lmcache.v1.memory_management import (
+from lmcache.v1.distributed.memory_manager import (
     BorrowedTensorMemoryObj,
-    MemoryFormat,
-    MemoryObjMetadata,
+    ShadowL1MemoryManager,
 )
+from lmcache.v1.memory_management import MemoryFormat, MemoryObjMetadata
 import lmcache.v1.memory_management as memory_management
 
 pytestmark = pytest.mark.no_shared_allocator
@@ -190,14 +189,15 @@ def test_deletion_releases_the_view(shadow: ShadowL1Manager) -> None:
     assert lease.releases == 1
 
 
-def test_release_all_ends_every_lease(shadow: ShadowL1Manager) -> None:
+def test_close_ends_every_lease_once(shadow: ShadowL1Manager) -> None:
     leases = [Lease(), Lease()]
     keys = [
         ObjectKey(chunk_hash=bytes([i]), model_name="shadow", kv_rank=0)
         for i in range(2)
     ]
     shadow.admit({k: _view(lease) for k, lease in zip(keys, leases, strict=True)})
-    shadow.release_all()
+    shadow.close()
+    shadow.close()  # the lender and the storage manager may both close it
     assert [lease.releases for lease in leases] == [1, 1]
 
 
@@ -217,16 +217,16 @@ def test_for_lender_rejects_a_segment_no_l1_backs(shadow: ShadowL1Manager) -> No
 def test_reaper_collects_a_view_whose_read_ttl_lapsed(
     shadow_1s: ShadowL1Manager,
 ) -> None:
-    """A reader past its TTL is gone: its late finish_read is refused, so the
-    reaper must free the view whatever the lease says, or the lender's
-    reservation stays pinned."""
+    """A reader past its TTL is gone and its late finish_read is refused, so
+    the shadow's own reaper must free the view whatever the lease says, or
+    the lender's reservation stays pinned."""
     lease = Lease()
     shadow_1s.admit({KEY: _view(lease)})
-    time.sleep(1.2)
-    assert shadow_1s.finish_read([KEY])[KEY] == L1Error.KEY_IN_WRONG_STATE
-    assert lease.releases == 0
-    shadow_1s.reap_expired()
+    deadline = time.monotonic() + 5.0
+    while lease.releases == 0 and time.monotonic() < deadline:
+        time.sleep(0.1)
     assert lease.releases == 1
+    assert shadow_1s.finish_read([KEY])[KEY] == L1Error.KEY_NOT_EXIST
     assert shadow_1s.unsafe_read([KEY])[KEY][0] == L1Error.KEY_NOT_EXIST
 
 

@@ -44,6 +44,7 @@ from lmcache.v1.distributed.internal_api import (
 from lmcache.v1.distributed.l1_manager import (
     DevDaxL1Manager,
     ShadowL1Manager,
+    borrowed_segment,
     create_l1_managers,
 )
 from lmcache.v1.distributed.l2_adapters import create_l2_adapter
@@ -79,7 +80,6 @@ from lmcache.v1.distributed.storage_controllers.store_policy import (
 from lmcache.v1.distributed.storage_controllers.utils import (
     L1ManagerDescriptor,
     L2AdapterDescriptor,
-    borrowed_segment,
     resolve_l1_affinity,
 )
 from lmcache.v1.distributed.storage_controllers.write_policy import (
@@ -153,31 +153,28 @@ class StorageManager:
             self._event_bus = get_event_bus()
 
             # L1 Managers: the configured ones own memory; a lending L2 adapter
-            # adds a shadow L1 (_build_l2_adapter). L1 containers are replaced,
-            # never mutated, so other threads see a snapshot.
+            # brings a shadow L1 (_build_l2_adapter). The L1 containers are
+            # replaced, never mutated, so other threads read a snapshot.
             self._owned_l1_managers: list[L1ManagerInterface] = create_l1_managers(
                 config.l1_manager_configs
             )
             for manager in self._owned_l1_managers:
                 cleanup.callback(manager.close)
+            self._l1_managers: list[L1ManagerInterface] = list(self._owned_l1_managers)
             # Lending adapter id -> the shadow L1 it brought.
             self._shadow_l1s: dict[int, ShadowL1Manager] = {}
             self._l1_defaults = config.l1_manager_config
-            self._l1_managers: list[L1ManagerInterface] = list(self._owned_l1_managers)
             self._l1_managers_by_id = {m.l1_manager_id: m for m in self._l1_managers}
             self._l1_by_tag = {m.config.tag: m for m in self._l1_managers}
 
             self._write_policy = create_write_policy(config.write_policy)
 
-            # L1 Eviction reclaims memory an L1 owns; a shadow L1 indexes a
-            # peer's bytes, which the peer evicts, so it gets no controller.
-            self._eviction_controllers = {
-                m.config.tag: L1EvictionController(
-                    m, m.config.eviction or config.eviction_config
-                )
+            # L1 Eviction reclaims memory an L1 owns; a shadow L1 has none.
+            self._eviction_controllers = [
+                L1EvictionController(m, m.config.eviction or config.eviction_config)
                 for m in self._owned_l1_managers
-            }
-            for eviction_controller in self._eviction_controllers.values():
+            ]
+            for eviction_controller in self._eviction_controllers:
                 eviction_controller.start()
                 cleanup.callback(eviction_controller.stop)
 
@@ -205,8 +202,6 @@ class StorageManager:
                 self._check_dax_devices_unowned(ac)
                 adapter_id, adapter, descriptor = self._build_l2_adapter(ac)
                 cleanup.callback(adapter.close)
-                if adapter_id in self._shadow_l1s:
-                    cleanup.callback(self._shadow_l1s[adapter_id].close)
                 self._l2_adapters[adapter_id] = adapter
                 self._adapter_descriptors[adapter_id] = descriptor
 
@@ -254,14 +249,13 @@ class StorageManager:
             # Storage controllers:
             # Controllers receive the initial set as ordered lists; they key
             # their own copies by ``descriptor.index`` (== adapter_id) and learn
-            # of later changes via add_adapter/request_remove_adapter. A
-            # lending adapter stores nothing: no store controller for it.
+            # of later changes via add_adapter/request_remove_adapter.
             self._store_controllers: dict[int, StoreController] = {}
             for manager in self._owned_l1_managers:
                 descriptors = [
                     d
                     for d in self._adapter_descriptors.values()
-                    if d.index not in self._shadow_l1s
+                    if d.index not in self._shadow_l1s  # a lender stores nothing
                     and resolve_l1_affinity(d.config, self._l1_by_tag)
                     == manager.config.tag
                 ]
@@ -285,7 +279,6 @@ class StorageManager:
                 adapter_descriptors=list(self._adapter_descriptors.values()),
                 policy=create_prefetch_policy(config.prefetch_policy),
                 inflight_watermark=config.prefetch_inflight_watermark,
-                shadow_l1s=dict(self._shadow_l1s),
             )
             self._prefetch_controller.start()
             cleanup.callback(self._prefetch_controller.stop)
@@ -1162,17 +1155,14 @@ class StorageManager:
                 with self._adapters_lock:
                     self._l2_adapters[adapter_id] = adapter
                     self._adapter_descriptors[adapter_id] = descriptor
-                shadow = self._shadow_l1s.get(adapter_id)
-                if shadow is None:
+                if adapter_id not in self._shadow_l1s:  # a lender stores nothing
                     store_owner = self._l1_by_tag[
                         resolve_l1_affinity(config, self._l1_by_tag)
                     ].l1_manager_id
                     self._store_controllers[store_owner].add_adapter(
                         adapter_id, adapter, descriptor
                     )
-                self._prefetch_controller.add_adapter(
-                    adapter_id, adapter, descriptor, shadow_l1=shadow
-                )
+                self._prefetch_controller.add_adapter(adapter_id, adapter, descriptor)
                 if self._should_enable_l2_eviction(adapter, config.eviction_config):
                     assert config.eviction_config is not None  # make linter happy
                     self._l2_eviction_controller.add_adapter_state(
@@ -1233,7 +1223,7 @@ class StorageManager:
             if adapter_id not in self._closing_adapters:
                 deadline = time.monotonic() + timeout
                 store_done: threading.Event | None = None
-                if adapter_id not in self._shadow_l1s:
+                if adapter_id not in self._shadow_l1s:  # a lender stores nothing
                     affinity = resolve_l1_affinity(
                         self._adapter_descriptors[adapter_id].config, self._l1_by_tag
                     )
@@ -1258,7 +1248,8 @@ class StorageManager:
                         "controller"
                     )
                 self._l2_eviction_controller.remove_adapter_state(adapter_id)
-                # The prefetch drain waited for every borrowed view.
+                # The prefetch drain waited for every borrowed view; the
+                # lender closes its shadow L1 with itself.
                 self._detach_shadow(adapter_id)
                 # From here the adapter is detached: not active, but kept in
                 # the registry until its close succeeds.
@@ -1313,13 +1304,9 @@ class StorageManager:
         self._prefetch_controller.stop()
         for controller in self._store_controllers.values():
             controller.stop()
-        for controller in self._eviction_controllers.values():
+        for controller in self._eviction_controllers:
             controller.stop()
         self._l2_eviction_controller.stop()
-
-        # End every borrowed view's lease once no controller can read it.
-        for shadow in self._shadow_l1s.values():
-            shadow.release_all()
 
         PeriodicEventNotifier.shutdown()
 
@@ -1344,32 +1331,30 @@ class StorageManager:
 
     @property
     def is_multi_l1(self) -> bool:
-        """Whether more than one L1 is attached, shadow L1s included.
+        """Whether more than one L1 is attached, a lender's shadow L1 included.
 
         Gates the per-tag status shape, owner-routed read completion and the
         ``L1[tag]`` device-owner names; reads without owners still resolve.
-        A lending adapter added at runtime brings a shadow L1 and can turn it on.
         """
         return len(self._l1_managers) > 1
 
     def report_status(self) -> dict:
-        """Return per-L1 status and aggregate health; retain single-L1 field names.
-
-        ``store_controllers`` and ``l1_eviction_controllers`` list only L1s
-        that own memory; ``l1_managers`` includes shadow L1s.
-        """
+        """Return per-L1 status and aggregate health; retain single-L1 field names."""
         managers = self._l1_managers
         tags = [m.config.tag for m in managers]
         l1s = {m.config.tag: m.report_status() for m in managers}
         capacities: dict[str, int] = defaultdict(int)
         for m in managers:
             capacities[m.backend_type.value] += m.get_capacity_bytes()
+        # Store and eviction controllers exist for L1s that own memory only.
+        owned_tags = [m.config.tag for m in self._owned_l1_managers]
         stores = {
             m.config.tag: self._store_controllers[m.l1_manager_id].report_status()
             for m in self._owned_l1_managers
         }
         evictions = {
-            tag: c.report_status() for tag, c in self._eviction_controllers.items()
+            tag: c.report_status()
+            for tag, c in zip(owned_tags, self._eviction_controllers, strict=True)
         }
         prefetch = self._prefetch_controller.report_status()
         l2_eviction = self._l2_eviction_controller.report_status()
@@ -1635,13 +1620,12 @@ class StorageManager:
         Raises:
             ValueError: If no L1 has the memory tags the adapter wants; or the
                 adapter wants a ``REMOTE`` L1 but is not a
-                :class:`LendingPeerL2AdapterBase`, uses serde, or borrows a segment no
-                L1 medium backs. A shadow L1 is supported only with a lending
-                adapter, whose views are read in place.
+                :class:`LendingPeerL2AdapterBase`, uses serde, or borrows a
+                segment no L1 medium backs.
 
         Note:
             A lending adapter maps peer memory itself; it gets a shadow L1
-            created here, which lives as long as it does.
+            created here and bound to it, which it closes with itself.
         """
         segment = borrowed_segment(config)
         if segment is not None and config.serde_config is not None:
@@ -1669,8 +1653,10 @@ class StorageManager:
             if segment is not None:
                 manager.close()
             raise
-        if segment is not None:
-            self._attach_shadow(adapter_id, cast(ShadowL1Manager, manager))
+        if isinstance(adapter, LendingPeerL2AdapterBase):
+            shadow = cast(ShadowL1Manager, manager)
+            adapter.bind_shadow_l1(shadow)
+            self._attach_shadow(adapter_id, shadow)
         if config.serde_config is not None:
             adapter = SerdeL2AdapterWrapper(
                 inner=adapter,
@@ -1690,25 +1676,23 @@ class StorageManager:
         return adapter_id, adapter, descriptor
 
     def _attach_shadow(self, adapter_id: int, shadow: ShadowL1Manager) -> None:
-        """Add a lending adapter's shadow L1 to the L1 set."""
+        """Add a lender's shadow L1 to the L1 set."""
         self._shadow_l1s = {**self._shadow_l1s, adapter_id: shadow}
         self._l1_managers = [*self._l1_managers, shadow]
         self._l1_managers_by_id = {m.l1_manager_id: m for m in self._l1_managers}
         self._l1_by_tag = {m.config.tag: m for m in self._l1_managers}
 
     def _detach_shadow(self, adapter_id: int) -> None:
-        """Remove and close a detached lending adapter's shadow L1, if any."""
+        """Drop a detached lender's shadow L1 from the L1 set, if it had one."""
         shadow = self._shadow_l1s.get(adapter_id)
         if shadow is None:
             return
-        shadows = dict(self._shadow_l1s)
-        del shadows[adapter_id]
-        self._shadow_l1s = shadows
+        self._shadow_l1s = {
+            k: v for k, v in self._shadow_l1s.items() if k != adapter_id
+        }
         self._l1_managers = [m for m in self._l1_managers if m is not shadow]
         self._l1_managers_by_id = {m.l1_manager_id: m for m in self._l1_managers}
         self._l1_by_tag = {m.config.tag: m for m in self._l1_managers}
-        shadow.release_all()
-        shadow.close()
 
     def _should_enable_l2_eviction(
         self,

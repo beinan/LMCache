@@ -15,7 +15,6 @@ from typing import TypeVar
 
 # First Party
 from lmcache.lmcache_native import Bitmap
-from lmcache.v1.distributed.api import MemoryResidency, MemorySegment
 from lmcache.v1.distributed.config import L1ManagerConfig
 from lmcache.v1.distributed.internal_api import L1ManagerInterface
 from lmcache.v1.distributed.l2_adapters.config import (
@@ -410,15 +409,6 @@ class MapState:
             if adapter_idx in self._state:
                 self[adapter_idx] = self._state[adapter_idx] - grid_r
         return self
-
-
-def borrowed_segment(adapter_config: L2AdapterConfigBase) -> MemorySegment | None:
-    """Return the segment a lender borrows views of (it wants a ``REMOTE`` L1
-    first), or None for an adapter that copies into ``LOCAL`` buffers."""
-    wanted = adapter_config.get_wanted_l1_memory_tags()
-    if wanted and wanted[0].residency is MemoryResidency.REMOTE:
-        return wanted[0].segment
-    return None
 
 
 def resolve_l1_affinity(

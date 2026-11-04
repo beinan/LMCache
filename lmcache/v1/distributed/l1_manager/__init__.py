@@ -27,7 +27,7 @@ from lmcache.v1.distributed.l1_manager.factory import (
     create_l1_managers,
 )
 from lmcache.v1.distributed.l1_manager.gds import GdsL1Manager
-from lmcache.v1.distributed.l1_manager.shadow import ShadowL1Manager
+from lmcache.v1.distributed.l1_manager.shadow import ShadowL1Manager, borrowed_segment
 
 __all__ = [
     "MAX_READ_LOCK_COUNT",
@@ -36,6 +36,7 @@ __all__ = [
     "GdsL1Manager",
     "L1ObjectState",
     "ShadowL1Manager",
+    "borrowed_segment",
     "create_l1_manager",
     "create_l1_managers",
     "l1_mgr_synchronized",

@@ -51,6 +51,7 @@ from lmcache.v1.distributed.l2_adapters.raw_block_l2_adapter import (
     RawBlockL2Adapter,
     RawBlockL2AdapterConfig,
 )
+from lmcache.v1.distributed.memory_manager import BorrowedTensorMemoryObj
 from lmcache.v1.distributed.storage_controllers.prefetch_controller import (
     PrefetchController,
 )
@@ -65,7 +66,6 @@ from lmcache.v1.distributed.storage_controllers.utils import (
     L2AdapterDescriptor,
 )
 from lmcache.v1.memory_management import (
-    BorrowedTensorMemoryObj,
     MemoryFormat,
     MemoryObjMetadata,
     TensorMemoryObj,
@@ -1993,20 +1993,20 @@ class TestShutdown:
 def make_lender(
     l1_manager: DramL1Manager, adapter_id: int = 0
 ) -> tuple[ShadowL1Manager, LendingMockL2Adapter]:
-    """A lending adapter and the shadow L1 it brings, as StorageManager makes them."""
+    """A lending adapter bound to the shadow L1 it brings, as StorageManager
+    makes them; the adapter closes the shadow with itself."""
     shadow = ShadowL1Manager.for_lender(
         adapter_id, MemorySegment.DRAM, l1_manager.config
     )
     adapter = LendingMockL2Adapter(LendingMockL2AdapterConfig())
+    adapter.bind_shadow_l1(shadow)
     return shadow, adapter
 
 
 def make_borrowing_controller(
-    l1_manager: DramL1Manager,
-    shadow: ShadowL1Manager,
-    adapter: LendingMockL2Adapter,
+    l1_manager: DramL1Manager, adapter: LendingMockL2Adapter
 ) -> PrefetchController:
-    """A controller over one local L1 and one lender (adapter 0) with its shadow."""
+    """A controller over one local L1 and one lender (adapter 0)."""
     return PrefetchController(
         l1_managers=[l1_manager],
         l1_manager_descriptors=[
@@ -2022,51 +2022,28 @@ def make_borrowing_controller(
             )
         ],
         policy=DefaultPrefetchPolicy(),
-        shadow_l1s={0: shadow},
     )
 
 
 class TestBorrowing:
-    def test_registration_refuses_a_lender_or_shadow_on_its_own(self, l1_manager):
-        """A lender without a shadow L1, or a shadow L1 on an adapter that
-        cannot lend, is refused at construction and at runtime instead of
-        binding to some other L1 or raising inside the loop on a hit."""
-        shadow, lender = make_lender(l1_manager)
-        copier = make_adapter()
-        lender_desc = L2AdapterDescriptor(
-            index=0,
-            config=LendingMockL2AdapterConfig(),
-        )
-        l1_desc = L1ManagerDescriptor(
-            index=l1_manager.l1_manager_id, config=l1_manager.config
-        )
+    def test_registration_refuses_a_lender_without_its_shadow(self, l1_manager):
+        """A lender whose shadow L1 is not bound is refused at construction and
+        at runtime instead of binding to some other L1 or raising inside the
+        loop on a hit."""
+        lender = LendingMockL2Adapter(LendingMockL2AdapterConfig())
+        lender_desc = L2AdapterDescriptor(index=0, config=LendingMockL2AdapterConfig())
         try:
-            for adapter, desc, shadows, match in (
-                (lender, lender_desc, {}, "shadow L1"),
-                (copier, make_descriptor(0), {0: shadow}, "does not lend"),
-            ):
-                with pytest.raises(ValueError, match=match):
-                    PrefetchController(
-                        l1_managers=[l1_manager],
-                        l1_manager_descriptors=[l1_desc],
-                        l2_adapters=[adapter],
-                        adapter_descriptors=[desc],
-                        policy=DefaultPrefetchPolicy(),
-                        shadow_l1s=shadows,
-                    )
+            with pytest.raises(ValueError, match="no shadow L1"):
+                make_borrowing_controller(l1_manager, lender)
             ctrl = make_controller(l1_manager, [])
             ctrl.start()
             try:
-                with pytest.raises(ValueError, match="shadow L1"):
+                with pytest.raises(ValueError, match="no shadow L1"):
                     ctrl.add_adapter(0, lender, lender_desc)
-                with pytest.raises(ValueError, match="does not lend"):
-                    ctrl.add_adapter(0, copier, make_descriptor(0), shadow_l1=shadow)
             finally:
                 ctrl.stop()
         finally:
             lender.close()
-            copier.close()
-            shadow.close()
 
     def test_runtime_lender_leaves_only_after_its_views_drain(self, l1_manager):
         """A lender added at runtime borrows into the shadow it came with; its
@@ -2083,7 +2060,6 @@ class TestBorrowing:
                 1,
                 adapter,
                 L2AdapterDescriptor(index=1, config=LendingMockL2AdapterConfig()),
-                shadow_l1=shadow,
             )
             result = wait_for_result(
                 ctrl, ctrl.submit_prefetch_request(single_row_spec(keys))
@@ -2107,7 +2083,6 @@ class TestBorrowing:
         finally:
             ctrl.stop()
             adapter.close()
-            shadow.close()
 
     def test_lent_views_are_admitted_into_the_shadow_l1(self, l1_manager):
         """Borrowed keys hit without allocating in any L1, and their lease
@@ -2116,7 +2091,7 @@ class TestBorrowing:
         layout = make_layout()
         keys = [make_object_key(i) for i in range(3)]
         store_keys_in_l2(adapter, keys, layout)
-        ctrl = make_borrowing_controller(l1_manager, shadow, adapter)
+        ctrl = make_borrowing_controller(l1_manager, adapter)
         ctrl.start()
         try:
             result = wait_for_result(
@@ -2135,7 +2110,6 @@ class TestBorrowing:
         finally:
             ctrl.stop()
             adapter.close()
-            shadow.close()
 
     def test_warm_prefetch_skips_lender_and_shadow_l1(self, l1_manager):
         """A NO_LOCK prefetch neither looks up a lender (a borrowed view cannot
@@ -2164,7 +2138,7 @@ class TestBorrowing:
             on_touch=lambda: touches.append(True),
         )
         assert shadow.admit({key: view})[key][0] == L1Error.SUCCESS
-        ctrl = make_borrowing_controller(l1_manager, shadow, adapter)
+        ctrl = make_borrowing_controller(l1_manager, adapter)
         ctrl.start()
         try:
             warm = wait_for_result(
@@ -2194,4 +2168,3 @@ class TestBorrowing:
         finally:
             ctrl.stop()
             adapter.close()
-            shadow.close()

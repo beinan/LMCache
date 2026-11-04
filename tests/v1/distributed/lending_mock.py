@@ -29,10 +29,12 @@ from lmcache.v1.distributed.l2_adapters.mock_l2_adapter import (
 )
 from lmcache.v1.distributed.l2_adapters.p2p_l2_adapter import (
     LendingPeerL2AdapterBase,
+    PeerL2AdapterBase,
     PeerL2AdapterConfigBase,
 )
+from lmcache.v1.distributed.memory_manager import BorrowedTensorMemoryObj
 from lmcache.v1.distributed.transfer_channel.api import TransferChannelAddress
-from lmcache.v1.memory_management import BorrowedTensorMemoryObj, MemoryObj
+from lmcache.v1.memory_management import MemoryObj
 
 
 class LendingMockL2AdapterConfig(PeerL2AdapterConfigBase):
@@ -113,8 +115,8 @@ class LendingMockL2Adapter(LendingPeerL2AdapterBase):
 
     def __init__(self, config: LendingMockL2AdapterConfig) -> None:
         self._owner = _FakeOwner()
-        self._found: dict[L2TaskId, set[ObjectKey]] = {}
-        self._lent: dict[L2TaskId, set[ObjectKey]] = {}
+        # Reservations a lookup took at the owner and no view consumed yet.
+        self._reserved: dict[ObjectKey, int] = {}
         self._live_views = 0
         self.lookup_count = 0
         self.touch_count = 0
@@ -154,35 +156,35 @@ class LendingMockL2Adapter(LendingPeerL2AdapterBase):
         self._lookup_efd.notify()
         return task_id
 
-    def query_lookup_and_lock_result(self, task_id: L2TaskId) -> Bitmap | None:
-        self._current_task = task_id
-        return super().query_lookup_and_lock_result(task_id)
-
     def _process_lookup_result(
         self, keys: list[ObjectKey], addresses: list[TransferChannelAddress]
     ) -> Bitmap:
         bitmap = Bitmap(len(keys))
-        found = set()
         for i, (key, address) in enumerate(zip(keys, addresses, strict=True)):
             if address.is_valid():
                 bitmap.set(i)
-                found.add(key)
-        self._found[self._current_task] = found
+                self._reserved[key] = self._reserved.get(key, 0) + 1
         return bitmap
+
+    def submit_unlock(self, keys: list[ObjectKey]) -> None:
+        """Return the reservations no view consumed; a lent key is its view's."""
+        returned = []
+        for key in keys:
+            if self._reserved.get(key, 0):
+                self._reserved[key] -= 1
+                returned.append(key)
+        super().submit_unlock(returned)
 
     # -- lending ------------------------------------------------------------
 
     def take_borrowed_objects(
-        self,
-        task_id: L2TaskId,
-        keys: list[ObjectKey],
-        layouts: dict[int, MemoryLayoutDesc],
+        self, keys: list[ObjectKey], layouts: dict[int, MemoryLayoutDesc]
     ) -> dict[ObjectKey, BorrowedTensorMemoryObj]:
-        found = self._found.pop(task_id, set())
         views = {}
         for key in keys:
-            if key not in found:
+            if not self._reserved.get(key, 0):
                 continue
+            self._reserved[key] -= 1
             stored = self._owner.objects[key]
             ended: list[bool] = []
             self._live_views += 1
@@ -194,7 +196,7 @@ class LendingMockL2Adapter(LendingPeerL2AdapterBase):
                 if not ended:
                     ended.append(True)
                     self._live_views -= 1
-                    self.submit_unlock([key])
+                    PeerL2AdapterBase.submit_unlock(self, [key])
 
             def touched() -> None:
                 self.touch_count += 1
@@ -206,12 +208,7 @@ class LendingMockL2Adapter(LendingPeerL2AdapterBase):
                 on_release=end_lease,
                 on_touch=touched,
             )
-        self._lent[task_id] = set(views)
         return views
-
-    def release_lookup(self, task_id: L2TaskId, keys: list[ObjectKey]) -> None:
-        lent = self._lent.pop(task_id, set())
-        self.submit_unlock([key for key in keys if key not in lent])
 
     def get_active_borrow_count(self) -> int:
         return self._live_views

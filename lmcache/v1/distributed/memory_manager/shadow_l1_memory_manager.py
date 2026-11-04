@@ -5,7 +5,10 @@
 from lmcache.v1.distributed.api import MemoryLayoutDesc
 from lmcache.v1.distributed.error import L1Error
 from lmcache.v1.distributed.internal_api import L1MemoryDesc
-from lmcache.v1.memory_management import BorrowedTensorMemoryObj, MemoryObj
+from lmcache.v1.distributed.memory_manager.borrowed_memory_obj import (
+    BorrowedTensorMemoryObj,
+)
+from lmcache.v1.memory_management import MemoryObj
 
 
 class ShadowL1MemoryManager:

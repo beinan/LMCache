@@ -314,8 +314,8 @@ _poll_lookup_results
 _transition_to_load_phase
   ├─ policy plans over L1 hits and every adapter's found bitmap
   ├─ submit_unlock(keys) for every locked key outside the plan
-  │  (release_lookup for a lender)
-  ├─ lender: take_borrowed_objects(keys) -> views into its shadow L1; done
+  ├─ lender: take_borrowed_objects(keys) -> views into its shadow L1, then
+  │  submit_unlock(keys), which skips the keys now owned by views; done
   ├─ L1 staging buffers reserved; on failure, submit_unlock for the
   │  affected keys and replan
   ├─ submit_load_task(keys, objs) per copying adapter in the plan
