@@ -1148,8 +1148,7 @@ class PrefetchController(StorageControllerInterface):
             for request in self._in_flight_requests.values()
             if request.phase == PrefetchPhase.LOOKUP
         )
-        # A lender's shadow L1 has no capacity to protect: views cost no
-        # local bytes, so it never gates admission.
+        # Views cost no local bytes: admission is gated on owned L1s only.
         target_l1_indices = {
             self._l2_affinity[adapter_idx]
             for adapter_idx in self._l2_adapters

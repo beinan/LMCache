@@ -33,7 +33,7 @@ the full system context.
 ```
 PeerL2AdapterBase             lookup/unlock RPCs, event fds, no-op stores, close
 ├── P2PL2Adapter              import the peer region; RDMA load over the transfer channel
-└── LendingPeerL2AdapterBase  abstract: lend views into a shadow L1 instead of loading
+└── LendingPeerL2AdapterBase  abstract: lend views of the peer's bytes into a shadow L1
 ```
 
 The base holds the RPC control plane so another way of reading a peer can

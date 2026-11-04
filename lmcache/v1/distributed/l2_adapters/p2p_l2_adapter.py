@@ -414,7 +414,7 @@ class PeerL2AdapterBase(L2AdapterInterface):
 
 
 class LendingPeerL2AdapterBase(PeerL2AdapterBase):
-    """A peer adapter that hands L1 views of the peer's bytes instead of copies.
+    """A peer adapter that hands L1 views of the peer's bytes.
 
     It wants a ``REMOTE`` L1 and maps the peer's memory itself. The storage
     manager creates a shadow L1 for it, binds it with :meth:`bind_shadow_l1`
@@ -424,11 +424,10 @@ class LendingPeerL2AdapterBase(PeerL2AdapterBase):
 
     A lookup hit reserves the key at the peer. A reservation that
     :meth:`take_borrowed_objects` moves into a view belongs to the view and
-    ends with its release; the controller returns the others with the usual
-    ``submit_unlock``, which never names a key that became a view. Every
-    request looks the lender up, so a view already resident in the shadow
-    adopts the newer lease and the older reservation comes back through the
-    discarded view's release: the lookup is the renewal.
+    ends with its release; the controller returns the others with
+    ``submit_unlock``. Every request looks the lender up; a view already
+    resident in the shadow adopts the newer lease, and the older reservation
+    comes back through the discarded view's release.
     """
 
     def __init__(self, config: PeerL2AdapterConfigBase) -> None:

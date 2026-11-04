@@ -49,8 +49,8 @@ class BorrowedTensorMemoryObj(TensorMemoryObj):
     def replace_lease(
         self, lease_is_valid: Callable[[], bool], on_release: Callable[[], None]
     ) -> None:
-        """Put the view under another lease, e.g. a newer reservation of the
-        same bytes; the previous lease is neither kept nor released here.
+        """Put the view under another lease, a newer reservation of the same
+        bytes. The caller owns the previous lease.
 
         Args:
             lease_is_valid: Nonblocking check that the new lease still holds.

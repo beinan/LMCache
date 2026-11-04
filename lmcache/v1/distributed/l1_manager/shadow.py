@@ -47,17 +47,15 @@ class ShadowL1Manager(BaseL1Manager):
     An L2 adapter that lends views (e.g. of a peer's memory) produces
     :class:`BorrowedTensorMemoryObj` objects; this manager indexes them by key
     so the ordinary read path (read locks, ``finish_read``, events) serves
-    them. Freeing an object ends its lease instead of returning memory. The
-    manager has no capacity, so write placement never targets it and it has
-    no eviction controller: the peer that owns the bytes evicts them.
+    them. Freeing an object ends its lease. The manager has no capacity: write
+    placement targets owned L1s, and the peer that owns the bytes evicts them.
 
     A view is admitted for one request's readers. Every request looks the
     lender up, so a key already resident adopts the newer lease while its
     holders keep reading, and the older reservation goes back. A view whose
     lease ended is never handed to a new reader; a holder keeps it until its
     last ``finish_read``, so a read must finish within the owner's TTL. An
-    entry whose readers' TTL lapsed is swept at the next ``admit``; nothing
-    else frees it.
+    entry whose readers' TTL lapsed is swept at the next ``admit``.
     """
 
     def __init__(

@@ -72,8 +72,8 @@ list in placement order, refuses a Device-DAX config whose range an earlier
 so device aliases resolve the way the allocator sees them), and closes the
 already-created managers on any failure. `StorageManager.__init__` is the
 only production caller; tests build single managers with
-`create_l1_manager(config)`. Shadow L1s are not configured: a lending L2
-adapter brings one (see below).
+`create_l1_manager(config)`. A lending L2 adapter brings its own shadow L1
+(see below).
 
 ## Write placement
 
@@ -104,9 +104,9 @@ never re-runs the policy; see [../storage_manager.md](../storage_manager.md).
 A shadow L1 is an index of memory somebody else owns. A lending peer adapter
 (`LendingPeerL2AdapterBase`, `l2_adapters/p2p_l2_adapter.py`) hands over
 borrowed views of a peer's KV bytes; `ShadowL1Manager` indexes them so the
-ordinary read path (`lookup`, read locks, `finish_read`) serves them unchanged.
-It holds no bytes and, like P2P, is never a hit source: every prefetch looks
-the lender up.
+ordinary read path (`lookup`, read locks, `finish_read`) serves them. It holds
+no bytes. Every prefetch looks the lender up; the shadow holds views for the
+requests that borrowed them.
 
 ```text
 lender ── take_borrowed_objects ──► views ── admit ──► shadow L1 ──► readers
@@ -115,21 +115,21 @@ lender ── take_borrowed_objects ──► views ── admit ──► shado
 ```
 
 - **It comes with the lender.** A lender wants a `REMOTE` L1 and maps peer
-  memory itself, so nothing is configured. `StorageManager` creates
+  memory itself. `StorageManager` creates
   `ShadowL1Manager.for_lender(adapter_id, segment, defaults)` (tag
   `shadow.<segment>.<adapter_id>`), binds it (`bind_shadow_l1`), and the
   adapter closes it with itself. Serde on a lender, or a lender/`REMOTE`
   mismatch in either direction, is refused before anything is registered.
 - **Nothing is written, stored or evicted here.** The peer owns the bytes.
-  No store or eviction controller; a shadow never gates prefetch admission.
+  Store and eviction controllers, and prefetch admission, apply to owned L1s.
 - **The lookup is the renewal.** `admit` read-locks each view for one request.
   A key already resident keeps its view, which adopts the fresh lease; the
-  older reservation goes back. No renew RPC.
+  older reservation goes back.
 - **A read must finish within the owner's TTL.** An ended lease refuses new
   readers; a holder keeps its view until `finish_read`. An entry whose
   readers' TTL lapsed is swept at the next `admit`.
-- **Only `LOCK` prefetches borrow.** A warm request would release the view at
-  once, a false hit.
+- **Only `LOCK` prefetches borrow.** A warm request keeps no read lock, and a
+  view lives only while read-locked.
 - **Status.** Tags are `(segment, REMOTE)`, so P2P never re-exports a view.
   A shadow is listed under `l1_managers` and makes `is_multi_l1` true.
 
