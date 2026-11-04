@@ -155,7 +155,8 @@ with that registration. This limit permits every profile listed above.
 A successful cuFile compatibility-mode transfer does not establish native
 GPUDirect DMA support; check the deployment's driver and filesystem.
 
-L1 topology is fixed at startup. The legacy single-region descriptor,
+Configured L1 topology is fixed at startup; only the shadow L1 a lending L2
+adapter brings comes and goes with that adapter. The legacy single-region descriptor,
 shared-memory transfer channel, P2P registration, and Device-DAX hotplug API
 require a single compatible L1. Multi-L1 GPU serving uses the existing
 LMCache-driven IPC transfer path. Hybrid models additionally require their
