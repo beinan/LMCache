@@ -4,6 +4,7 @@
 # Standard
 from collections.abc import Mapping
 from dataclasses import replace
+from typing import cast
 
 # First Party
 from lmcache import torch_dev
@@ -206,6 +207,22 @@ class ShadowL1Manager(BaseL1Manager):
             )
         )
         return ret
+
+    @l1_mgr_synchronized
+    def touch_keys(self, keys: list[ObjectKey]) -> None:
+        """Report the hits as usual, and tell each valid view's lender.
+
+        A lender renews a lease that is near its end on a touch; otherwise a
+        hot view would die after one owner TTL however often it is read.
+
+        Args:
+            keys: The keys a reader hit.
+        """
+        super().touch_keys(keys)
+        for key in keys:
+            entry = self._objects.get(key)
+            if entry is not None and entry.memory_obj.is_valid():
+                cast(BorrowedTensorMemoryObj, entry.memory_obj).touch()
 
     @l1_mgr_synchronized
     def reap_expired(self) -> None:

@@ -46,8 +46,9 @@ class LendingMockL2Adapter(MockL2Adapter):
 
     A view's lease is the key's lookup lock: ending it unlocks the key.
     ``lookup_count`` counts lookups, so a test can assert that a request
-    never consulted the lender; ``get_active_borrow_count`` counts views
-    whose lease has not ended, so adapter removal drains them first.
+    never consulted the lender; ``touch_count`` counts reader hits on its
+    views; ``get_active_borrow_count`` counts views whose lease has not
+    ended, so adapter removal drains them first.
     """
 
     def __init__(self, config: MockL2AdapterConfig) -> None:
@@ -55,6 +56,7 @@ class LendingMockL2Adapter(MockL2Adapter):
         self._lent: dict[L2TaskId, set[ObjectKey]] = {}
         self._live_views = 0
         self.lookup_count = 0
+        self.touch_count = 0
 
     def submit_lookup_and_lock_task(
         self, keys: list[ObjectKey], group_layout_descs: dict[int, MemoryLayoutDesc]
@@ -84,11 +86,15 @@ class LendingMockL2Adapter(MockL2Adapter):
                     self._live_views -= 1
                     self.submit_unlock([key])
 
+            def touched() -> None:
+                self.touch_count += 1
+
             views[key] = BorrowedTensorMemoryObj(
                 stored.raw_data,
                 stored.meta,
                 lease_is_valid=lease_is_valid,
                 on_release=end_lease,
+                on_touch=touched,
             )
         return views
 

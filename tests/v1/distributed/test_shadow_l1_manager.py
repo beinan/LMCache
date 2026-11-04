@@ -48,6 +48,10 @@ class Lease:
     def __init__(self) -> None:
         self.valid = True
         self.releases = 0
+        self.touches = 0
+
+    def touch(self) -> None:
+        self.touches += 1
 
     def is_valid(self) -> bool:
         return self.valid and self.releases == 0
@@ -71,6 +75,7 @@ def _view(lease: Lease) -> BorrowedTensorMemoryObj:
         ),
         lease_is_valid=lease.is_valid,
         on_release=lease.release,
+        on_touch=lease.touch,
     )
 
 
@@ -246,3 +251,16 @@ def test_admit_replaces_a_stale_unheld_view(fake_pinned_memory: None) -> None:
     finally:
         shadow.close()
         local.close()
+
+
+def test_touch_reaches_the_lender_of_a_valid_view(shadow: ShadowL1Manager) -> None:
+    """A reader hit is forwarded to the lender so it can renew the lease; an
+    expired or absent view is not touched."""
+    lease = Lease()
+    shadow.admit({KEY: _view(lease)})
+    other = ObjectKey(chunk_hash=b"absent", model_name="shadow", kv_rank=0)
+    shadow.touch_keys([KEY, other])
+    assert lease.touches == 1
+    lease.valid = False
+    shadow.touch_keys([KEY])
+    assert lease.touches == 1

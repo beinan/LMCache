@@ -149,6 +149,12 @@ lending L2 adapter                         ShadowL1Manager (metadata only)
   late `finish_read` is refused and would never free it. The lease state does
   not matter for reaping; a reader past its TTL is treated as gone, as in
   every L1.
+- **Renewal.** A lease is bounded by the owner's read-lock TTL. Every L1 hit
+  reaches `touch_keys`, which the shadow forwards to the view's `on_touch`, so
+  the lender can renew a lease that is near its end (a batched extend RPC to
+  the owner, in the lending adapter). A hot borrowed view therefore lives as
+  long as it is read, like the owner's own readers keep an object; a borrower
+  that dies stops touching, and the owner's TTL releases the lock.
 - **Tags.** The shadow reports the borrowed segment with `REMOTE` residency.
   P2P serving, which resolves a `LOCAL` L1, never re-exports a borrowed view.
 - **Who borrows.** The prefetch controller borrows when an adapter brought a

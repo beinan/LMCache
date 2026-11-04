@@ -2176,6 +2176,7 @@ class TestBorrowing:
         layout = make_layout()
         key = make_object_key(0)
         released: list[bool] = []
+        touches: list[bool] = []
         view = BorrowedTensorMemoryObj(
             torch.zeros(layout.shapes[0], dtype=layout.dtypes[0]),
             MemoryObjMetadata(
@@ -2190,6 +2191,7 @@ class TestBorrowing:
             ),
             lease_is_valid=lambda: not released,
             on_release=lambda: released.append(True),
+            on_touch=lambda: touches.append(True),
         )
         assert shadow.admit({key: view})[key][0] == L1Error.SUCCESS
         ctrl = make_borrowing_controller(l1_manager, shadow, adapter)
@@ -2211,6 +2213,8 @@ class TestBorrowing:
             assert row_bits(locked) == [0]
             assert locked is not None
             assert locked.l1_owners == {key: shadow.l1_manager_id}
+            assert released == []  # the warm request touched nothing
+            assert touches == [True]  # the LOCK hit told the lender
             shadow.finish_read([key])  # the LOCK prefetch's lock
             assert not released
             shadow.finish_read([key])  # the original holder's lock
