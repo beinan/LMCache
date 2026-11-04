@@ -122,6 +122,7 @@ lender ── take_borrowed_objects ──► views ── admit ──► shado
   a lender, is refused before anything is registered.
 - **Nothing is written, stored or evicted here.** The peer owns and evicts
   the bytes. A view leaves with its last reader, the reaper, or the adapter.
+  Having no capacity, a shadow never gates prefetch admission either.
 - **A view lives only while held.** `admit` indexes and read-locks each view;
   a resident valid view wins over a duplicate, a stale unheld one is replaced.
   An ended lease refuses new readers while a holder keeps its view until
