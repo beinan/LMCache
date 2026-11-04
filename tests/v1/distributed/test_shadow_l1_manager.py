@@ -89,16 +89,29 @@ def fake_pinned_memory(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(memory_management, "_free_cpu_memory", lambda *a, **k: None)
 
 
-@pytest.fixture
-def shadow(fake_pinned_memory: None) -> Iterator[ShadowL1Manager]:
-    """A shadow L1 paired with a DRAM L1, as an RDMA borrower would use."""
+def _shadow(read_ttl_seconds: int = 300) -> tuple[ShadowL1Manager, DramL1Manager]:
+    """A DRAM lender's shadow L1 and the local L1 whose config it inherits."""
     local = DramL1Manager(
         L1ManagerConfig(
             L1MemoryManagerConfig(size_in_bytes=PAGE, use_lazy=False, shm_name=""),
-            read_ttl_seconds=300,
+            read_ttl_seconds=read_ttl_seconds,
         )
     )
-    manager = ShadowL1Manager.for_lender(0, MemorySegment.DRAM, local.config)
+    return ShadowL1Manager.for_lender(0, MemorySegment.DRAM, local.config), local
+
+
+@pytest.fixture
+def shadow(fake_pinned_memory: None) -> Iterator[ShadowL1Manager]:
+    manager, local = _shadow()
+    yield manager
+    manager.close()
+    local.close()
+
+
+@pytest.fixture
+def shadow_1s(fake_pinned_memory: None) -> Iterator[ShadowL1Manager]:
+    """A shadow whose read-lock TTL lapses after one second."""
+    manager, local = _shadow(read_ttl_seconds=1)
     yield manager
     manager.close()
     local.close()
@@ -202,55 +215,33 @@ def test_for_lender_rejects_a_segment_no_l1_backs(shadow: ShadowL1Manager) -> No
 
 
 def test_reaper_collects_a_view_whose_read_ttl_lapsed(
-    fake_pinned_memory: None,
+    shadow_1s: ShadowL1Manager,
 ) -> None:
     """A reader past its TTL is gone: its late finish_read is refused, so the
     reaper must free the view whatever the lease says, or the lender's
     reservation stays pinned."""
-    local = DramL1Manager(
-        L1ManagerConfig(
-            L1MemoryManagerConfig(size_in_bytes=PAGE, use_lazy=False, shm_name=""),
-            read_ttl_seconds=1,
-        )
-    )
-    shadow = ShadowL1Manager.for_lender(0, MemorySegment.DRAM, local.config)
-    try:
-        lease = Lease()
-        shadow.admit({KEY: _view(lease)})
-        time.sleep(1.2)
-        assert shadow.finish_read([KEY])[KEY] == L1Error.KEY_IN_WRONG_STATE
-        assert lease.releases == 0
-        shadow.reap_expired()
-        assert lease.releases == 1
-        assert shadow.unsafe_read([KEY])[KEY][0] == L1Error.KEY_NOT_EXIST
-    finally:
-        shadow.close()
-        local.close()
+    lease = Lease()
+    shadow_1s.admit({KEY: _view(lease)})
+    time.sleep(1.2)
+    assert shadow_1s.finish_read([KEY])[KEY] == L1Error.KEY_IN_WRONG_STATE
+    assert lease.releases == 0
+    shadow_1s.reap_expired()
+    assert lease.releases == 1
+    assert shadow_1s.unsafe_read([KEY])[KEY][0] == L1Error.KEY_NOT_EXIST
 
 
-def test_admit_replaces_a_stale_unheld_view(fake_pinned_memory: None) -> None:
+def test_admit_replaces_a_stale_unheld_view(shadow_1s: ShadowL1Manager) -> None:
     """An expired view nobody holds must not refuse a fresh one for its key."""
-    local = DramL1Manager(
-        L1ManagerConfig(
-            L1MemoryManagerConfig(size_in_bytes=PAGE, use_lazy=False, shm_name=""),
-            read_ttl_seconds=1,
-        )
-    )
-    shadow = ShadowL1Manager.for_lender(0, MemorySegment.DRAM, local.config)
-    try:
-        stale = Lease()
-        shadow.admit({KEY: _view(stale)})
-        stale.valid = False
-        time.sleep(1.2)  # the holder's TTL lapses: stale and unheld
-        fresh = Lease()
-        view = _view(fresh)
-        assert shadow.admit({KEY: view})[KEY] == (L1Error.SUCCESS, view)
-        assert stale.releases == 1
-        assert fresh.releases == 0
-        assert shadow.unsafe_read([KEY])[KEY] == (L1Error.SUCCESS, view)
-    finally:
-        shadow.close()
-        local.close()
+    stale = Lease()
+    shadow_1s.admit({KEY: _view(stale)})
+    stale.valid = False
+    time.sleep(1.2)  # the holder's TTL lapses: stale and unheld
+    fresh = Lease()
+    view = _view(fresh)
+    assert shadow_1s.admit({KEY: view})[KEY] == (L1Error.SUCCESS, view)
+    assert stale.releases == 1
+    assert fresh.releases == 0
+    assert shadow_1s.unsafe_read([KEY])[KEY] == (L1Error.SUCCESS, view)
 
 
 def test_touch_reaches_the_lender_of_a_valid_view(shadow: ShadowL1Manager) -> None:

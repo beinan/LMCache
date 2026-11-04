@@ -413,17 +413,8 @@ class MapState:
 
 
 def borrowed_segment(adapter_config: L2AdapterConfigBase) -> MemorySegment | None:
-    """Return the segment an L2 adapter borrows views of, if it lends.
-
-    A lending adapter wants a ``REMOTE`` L1 first; a copying one wants
-    ``LOCAL`` buffers.
-
-    Args:
-        adapter_config: The L2 adapter's configuration.
-
-    Returns:
-        The borrowed segment, or None for an adapter that copies.
-    """
+    """Return the segment a lender borrows views of (it wants a ``REMOTE`` L1
+    first), or None for an adapter that copies into ``LOCAL`` buffers."""
     wanted = adapter_config.get_wanted_l1_memory_tags()
     if wanted and wanted[0].residency is MemoryResidency.REMOTE:
         return wanted[0].segment

@@ -1,14 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""A lending peer adapter over an in-memory fake owner, registered as
-``lending_mock``.
-
-``LendingMockL2Adapter`` is a real ``LendingPeerL2AdapterBase``: lookups,
-locks and unlocks go through the peer base's RPC path to ``_FakeOwner``, which
-stores tensors and counts locks, so controller and storage-manager tests need
-no transport. ``NonLendingMockL2AdapterConfig`` (``nonlending_mock``) wants a
-``REMOTE`` L1 but builds a plain mock, to test that a shadow L1 is refused to
-anything but a lender.
-"""
+"""A lending peer adapter over an in-memory fake owner (``lending_mock``), and
+a REMOTE-wanting config whose adapter cannot lend (``nonlending_mock``)."""
 
 # Standard
 from typing import Optional
@@ -117,12 +109,7 @@ class _FakeOwner:
 
 
 class LendingMockL2Adapter(LendingPeerL2AdapterBase):
-    """Lends views of the fake owner's tensors; a view's lease is its lock.
-
-    ``lookup_count`` counts lookups, ``touch_count`` reader hits on views,
-    and ``get_active_borrow_count`` views whose lease has not ended, so
-    adapter removal drains them first.
-    """
+    """Lends views of the fake owner's tensors; a view's lease is its lock."""
 
     def __init__(self, config: LendingMockL2AdapterConfig) -> None:
         self._owner = _FakeOwner()

@@ -2068,9 +2068,10 @@ class TestBorrowing:
             copier.close()
             shadow.close()
 
-    def test_runtime_lender_brings_and_takes_its_shadow(self, l1_manager):
-        """A lender added at runtime borrows into the shadow it came with;
-        once removed, its shadow is gone from the controller's L1 set."""
+    def test_runtime_lender_leaves_only_after_its_views_drain(self, l1_manager):
+        """A lender added at runtime borrows into the shadow it came with; its
+        removal completes only once every lent view is released, and then the
+        shadow is gone from the controller's L1 set."""
         shadow, adapter = make_lender(l1_manager, adapter_id=1)
         layout = make_layout()
         keys = [make_object_key(i) for i in range(2)]
@@ -2081,10 +2082,7 @@ class TestBorrowing:
             ctrl.add_adapter(
                 1,
                 adapter,
-                L2AdapterDescriptor(
-                    index=1,
-                    config=LendingMockL2AdapterConfig(),
-                ),
+                L2AdapterDescriptor(index=1, config=LendingMockL2AdapterConfig()),
                 shadow_l1=shadow,
             )
             result = wait_for_result(
@@ -2093,41 +2091,19 @@ class TestBorrowing:
             assert row_bits(result) == [0, 1]
             assert result is not None
             assert result.l1_owners == dict.fromkeys(keys, shadow.l1_manager_id)
-            shadow.finish_read(keys)
 
             done = ctrl.request_remove_adapter(1)
+            assert not done.wait(timeout=1.0)
+            assert adapter.get_active_borrow_count() == 2
+            shadow.finish_read(keys)
             assert done.wait(timeout=5.0)
+            assert adapter.get_active_borrow_count() == 0
             assert_l2_unlocked(adapter)
             # The shadow left with its lender: nothing serves its keys now.
             result = wait_for_result(
                 ctrl, ctrl.submit_prefetch_request(single_row_spec(keys))
             )
             assert row_bits(result) == []
-        finally:
-            ctrl.stop()
-            adapter.close()
-            shadow.close()
-
-    def test_removal_waits_for_live_views(self, l1_manager):
-        """A lender is detached only once every view it lent is released,
-        so its memory is never unmapped under a reader."""
-        shadow, adapter = make_lender(l1_manager)
-        layout = make_layout()
-        keys = [make_object_key(i) for i in range(2)]
-        store_keys_in_l2(adapter, keys, layout)
-        ctrl = make_borrowing_controller(l1_manager, shadow, adapter)
-        ctrl.start()
-        try:
-            result = wait_for_result(
-                ctrl, ctrl.submit_prefetch_request(single_row_spec(keys))
-            )
-            assert row_bits(result) == [0, 1]
-            done = ctrl.request_remove_adapter(0)
-            assert not done.wait(timeout=1.0)
-            assert adapter.get_active_borrow_count() == 2
-            shadow.finish_read(keys)
-            assert done.wait(timeout=5.0)
-            assert adapter.get_active_borrow_count() == 0
         finally:
             ctrl.stop()
             adapter.close()
@@ -2161,39 +2137,14 @@ class TestBorrowing:
             adapter.close()
             shadow.close()
 
-    def test_warm_prefetch_skips_lending_adapter(self, l1_manager):
-        """A NO_LOCK prefetch never looks up a lending adapter: a borrowed
-        view cannot outlive its read locks, so it would be a false hit."""
+    def test_warm_prefetch_skips_lender_and_shadow_l1(self, l1_manager):
+        """A NO_LOCK prefetch neither looks up a lender (a borrowed view cannot
+        outlive its read locks, so it would be a false hit) nor a shadow L1 (a
+        view held there belongs to its readers). A LOCK prefetch still hits."""
         shadow, adapter = make_lender(l1_manager)
         layout = make_layout()
-        keys = [make_object_key(i) for i in range(3)]
-        store_keys_in_l2(adapter, keys, layout)
-        ctrl = make_borrowing_controller(l1_manager, shadow, adapter)
-        ctrl.start()
-        try:
-            result = wait_for_result(
-                ctrl,
-                ctrl.submit_prefetch_request(
-                    single_row_spec(keys, lock_mode=PrefetchLockMode.NO_LOCK)
-                ),
-            )
-            assert row_bits(result) == []
-            assert adapter.lookup_count == 0
-            assert_absent(l1_manager, keys)
-            assert_absent(shadow, keys)  # type: ignore[arg-type]
-            assert_l2_unlocked(adapter)
-        finally:
-            ctrl.stop()
-            adapter.close()
-            shadow.close()
-
-    def test_warm_prefetch_skips_shadow_l1(self, l1_manager):
-        """A NO_LOCK prefetch does not look up a shadow L1: a view held there
-        belongs to its readers, so a warm hit must not touch its locks. A
-        LOCK prefetch still hits it."""
-        shadow, adapter = make_lender(l1_manager)
-        layout = make_layout()
-        key = make_object_key(0)
+        key, other = make_object_key(0), make_object_key(1)
+        store_keys_in_l2(adapter, [other], layout)
         released: list[bool] = []
         touches: list[bool] = []
         view = BorrowedTensorMemoryObj(
@@ -2219,10 +2170,12 @@ class TestBorrowing:
             warm = wait_for_result(
                 ctrl,
                 ctrl.submit_prefetch_request(
-                    single_row_spec([key], lock_mode=PrefetchLockMode.NO_LOCK)
+                    single_row_spec([key, other], lock_mode=PrefetchLockMode.NO_LOCK)
                 ),
             )
             assert row_bits(warm) == []
+            assert adapter.lookup_count == 0
+            assert_l2_unlocked(adapter)
             assert shadow.unsafe_read([key])[key][0] == L1Error.SUCCESS
             assert not released
 
