@@ -313,8 +313,7 @@ class BaseL1Manager(L1ManagerInterface):
             of (L1Error, Optional[MemoryObj]).
 
         Errors:
-            KEY_NOT_EXIST: The key does not exist, or its object is no
-                longer valid (e.g. a borrowed view whose lease ended).
+            KEY_NOT_EXIST: The key does not exist.
 
         Note:
             Staging objects are never readable; a key that is only
