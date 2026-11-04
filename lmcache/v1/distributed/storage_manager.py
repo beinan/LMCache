@@ -151,8 +151,8 @@ class StorageManager:
             self._event_bus = get_event_bus()
 
             # L1 Managers: the configured ones own memory; a lending L2 adapter
-            # adds a shadow L1 (_build_l2_adapter). The L1 containers are
-            # replaced, never mutated, so other threads see a snapshot.
+            # adds a shadow L1 (_build_l2_adapter). L1 containers are replaced,
+            # never mutated, so other threads see a snapshot.
             self._owned_l1_managers: list[L1ManagerInterface] = create_l1_managers(
                 config.l1_manager_configs
             )
@@ -163,9 +163,6 @@ class StorageManager:
             self._l1_defaults = config.l1_manager_config
             self._l1_managers: list[L1ManagerInterface] = list(self._owned_l1_managers)
             self._l1_managers_by_id = {m.l1_manager_id: m for m in self._l1_managers}
-            # Shadow L1s hold borrowed views only, so writes are never placed
-            # there.
-            self._writable_l1_managers = list(self._owned_l1_managers)
             self._l1_by_tag = {m.config.tag: m for m in self._l1_managers}
 
             self._write_policy = create_write_policy(config.write_policy)
@@ -327,9 +324,8 @@ class StorageManager:
             ValueError: The write policy selected an unregistered L1 manager
                 or did not place every key exactly once.
         """
-        targets = self._write_policy.select_write_targets(
-            keys, self._writable_l1_managers
-        )
+        # Shadow L1s hold borrowed views only, so writes go to owned L1s.
+        targets = self._write_policy.select_write_targets(keys, self._owned_l1_managers)
         _validate_write_targets(keys, targets, self._l1_managers_by_id)
         reserve_result: dict[ObjectKey, L1OperationResult] = {}
         for owner, group in targets.items():
@@ -1143,20 +1139,18 @@ class StorageManager:
             # Mirror of the check in add_l1_devdax_device: a single-region
             # adapter may only be added while L1 is exactly one memory region.
             adapter_name = requires_single_l1_memory_region(config)
+            region_count = 1
             if adapter_name is not None:
                 manager = self._l1_by_tag[resolve_l1_affinity(config, self._l1_by_tag)]
-                region_count = (
-                    manager.memory_region_count()
-                    if isinstance(manager, DevDaxL1Manager)
-                    else 1
+                if isinstance(manager, DevDaxL1Manager):
+                    region_count = manager.memory_region_count()
+            if adapter_name is not None and region_count > 1:
+                raise ValueError(
+                    f"{adapter_name} registers a single L1 memory region, but "
+                    f"L1 currently spans {region_count} regions (more than one "
+                    "Device-DAX arena); remove the additional Device-DAX "
+                    "regions before adding it"
                 )
-                if region_count > 1:
-                    raise ValueError(
-                        f"{adapter_name} registers a single L1 memory region, "
-                        f"but L1 currently spans {region_count} regions (more "
-                        "than one Device-DAX arena); remove the additional "
-                        "Device-DAX regions before adding it"
-                    )
             self._check_dax_devices_unowned(config)
             adapter_id, adapter, descriptor = self._build_l2_adapter(config)
             store_owner: int | None = None
