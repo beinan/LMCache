@@ -45,7 +45,7 @@ from lmcache.v1.distributed.l2_adapters.config import (
 from lmcache.v1.distributed.l2_adapters.factory import register_l2_adapter_factory
 from lmcache.v1.distributed.transfer_channel import get_transfer_channel_context
 from lmcache.v1.distributed.transfer_channel.api import TransferChannelAddress
-from lmcache.v1.memory_management import MemoryObj
+from lmcache.v1.memory_management import BorrowedTensorMemoryObj, MemoryObj
 from lmcache.v1.multiprocess.transport.base import RequestClient
 from lmcache.v1.multiprocess.transport.factory import RequestClientFactory
 from lmcache.v1.platform import HAS_EVENTFD, create_event_notifier
@@ -156,8 +156,7 @@ class PeerL2AdapterBase(L2AdapterInterface):
     (:meth:`_process_lookup_result`) and implement the load interface: a
     copying adapter records each hit's address for a later load, while a
     lending adapter keeps the reservation and hands L1 a borrowed view of
-    the peer's bytes instead of copying them (it also derives from
-    :class:`~lmcache.v1.distributed.l2_adapters.lending.LendingL2Adapter`).
+    the peer's bytes instead of copying them (:class:`LendingPeerL2AdapterBase`).
 
     Constructor contract: the region hook runs inside this constructor,
     after the base state is set but before the subclass's own ``__init__``
@@ -390,6 +389,54 @@ class PeerL2AdapterBase(L2AdapterInterface):
         Returns:
             A bitmap with bit ``i`` set when ``keys[i]`` is readable.
         """
+
+
+class LendingPeerL2AdapterBase(PeerL2AdapterBase):
+    """A peer adapter that hands L1 views of the peer's bytes instead of copies.
+
+    A shadow L1 is supported only with this type: the storage manager creates
+    one for it at registration, and the prefetch controller admits the views
+    it lends there. It wants a ``REMOTE`` L1 and resolves the peer's memory
+    itself; a subclass implements the three lending hooks below.
+    """
+
+    @abstractmethod
+    def take_borrowed_objects(
+        self,
+        task_id: L2TaskId,
+        keys: list[ObjectKey],
+        layouts: dict[int, MemoryLayoutDesc],
+    ) -> dict[ObjectKey, BorrowedTensorMemoryObj]:
+        """Lend views of found keys instead of copying them.
+
+        Args:
+            task_id: Completed lookup's local task identity.
+            keys: Selected keys whose reservations the caller will own.
+            layouts: Expected layout by object-group ID.
+
+        Returns:
+            A borrowed view per key it can lend; each view's lease covers the
+            key's reservation. Missing keys stay releasable through
+            :meth:`release_lookup`.
+
+        Note:
+            Must not raise once it has created a view; a key it cannot lend
+            is omitted, since a view that never reaches the caller is only
+            released by its finalizer.
+        """
+
+    @abstractmethod
+    def release_lookup(self, task_id: L2TaskId, keys: list[ObjectKey]) -> None:
+        """Return the reservations of a lookup that were not moved into views.
+
+        Args:
+            task_id: Local lookup identity.
+            keys: Reservations to return.
+        """
+
+    @abstractmethod
+    def get_active_borrow_count(self) -> int:
+        """Return live borrowed views, which must drain before removal."""
 
 
 class P2PL2Adapter(PeerL2AdapterBase):

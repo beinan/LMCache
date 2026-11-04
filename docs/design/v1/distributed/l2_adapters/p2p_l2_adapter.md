@@ -31,8 +31,9 @@ the full system context.
 ## Class layout
 
 ```
-PeerL2AdapterBase   lookup/unlock RPCs, event fds, no-op stores, close
-└── P2PL2Adapter    import the peer region; RDMA load over the transfer channel
+PeerL2AdapterBase             lookup/unlock RPCs, event fds, no-op stores, close
+├── P2PL2Adapter              import the peer region; RDMA load over the transfer channel
+└── LendingPeerL2AdapterBase  abstract: lend views into a shadow L1 instead of loading
 ```
 
 The base holds the RPC control plane so another way of reading a peer can
@@ -56,11 +57,11 @@ means, while the polling, timeout and failure handling around it stay shared:
 | Copy (`P2PL2Adapter`) | records the address; a later load copies the bytes into local L1 |
 | Lend (a follow-up subclass, e.g. GPU-direct or CXL in place) | keeps the reservation and hands L1 a borrowed view; no copy, no local capacity |
 
-A lending subclass also derives from `LendingL2Adapter`
-(`l2_adapters/lending.py`), which declares `take_borrowed_objects`,
-`release_lookup` and `get_active_borrow_count`. That type, not a method
-check, is what lets the storage manager give it a shadow L1; it wants a
-`REMOTE` L1 and cannot use serde, since its views are read in place. See
+The lend strategy has its own abstract base, `LendingPeerL2AdapterBase`,
+which adds `take_borrowed_objects`, `release_lookup` and
+`get_active_borrow_count`. That type is what lets the storage manager give an
+adapter a shadow L1; it wants a `REMOTE` L1 and cannot use serde, since its
+views are read in place. See
 [../l1_manager/l1-manager-types.md](../l1_manager/l1-manager-types.md)
 ("Shadow L1").
 

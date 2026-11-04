@@ -52,7 +52,9 @@ from lmcache.v1.distributed.l2_adapters.config import (
     L2AdapterConfigBase,
     get_type_name_for_config,
 )
-from lmcache.v1.distributed.l2_adapters.lending import LendingL2Adapter
+from lmcache.v1.distributed.l2_adapters.p2p_l2_adapter import (
+    LendingPeerL2AdapterBase,
+)
 from lmcache.v1.distributed.l2_adapters.reconfiguration import (
     L2DeviceOwner,
     L2ReconfigurableAdapter,
@@ -1633,7 +1635,7 @@ class StorageManager:
         Raises:
             ValueError: If no L1 has the memory tags the adapter wants; or the
                 adapter wants a ``REMOTE`` L1 but is not a
-                :class:`LendingL2Adapter`, uses serde, or borrows a segment no
+                :class:`LendingPeerL2AdapterBase`, uses serde, or borrows a segment no
                 L1 medium backs. A shadow L1 is supported only with a lending
                 adapter, whose views are read in place.
 
@@ -1655,11 +1657,13 @@ class StorageManager:
             adapter: L2AdapterInterface = create_l2_adapter(
                 config, manager.get_l1_memory_desc()
             )
-            if segment is not None and not isinstance(adapter, LendingL2Adapter):
+            if segment is not None and not isinstance(
+                adapter, LendingPeerL2AdapterBase
+            ):
                 adapter.close()
                 raise ValueError(
                     f"L2 adapter {adapter_id} wants a REMOTE L1 but is not a "
-                    "LendingL2Adapter; a shadow L1 is supported only with one"
+                    "LendingPeerL2AdapterBase; a shadow L1 is supported only with one"
                 )
         except Exception:
             if segment is not None:

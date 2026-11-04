@@ -466,9 +466,7 @@ class TestStorageManagerRuntimeAdapters:
         with the adapter."""
         sm = StorageManager(empty_storage_manager_config)
         try:
-            adapter_id = sm.add_l2_adapter(
-                LendingMockL2AdapterConfig(max_size_gb=0.01, mock_bandwidth_gb=10.0)
-            )
+            adapter_id = sm.add_l2_adapter(LendingMockL2AdapterConfig())
             status = sm.report_status()
             shadow_tag = f"shadow.dram.{adapter_id}"
             assert set(status["l1_managers"]) == {"_default", shadow_tag}
@@ -492,27 +490,25 @@ class TestStorageManagerRuntimeAdapters:
     def test_shadow_l1_is_refused_to_anything_but_a_lender(
         self, empty_storage_manager_config
     ):
-        """A REMOTE-wanting adapter that is not a LendingL2Adapter, or a lender
+        """A REMOTE-wanting adapter that is not a LendingPeerL2AdapterBase, or a lender
         with serde, is refused before anything is registered: no adapter, no
         shadow L1, and the next lender gets the next id."""
         sm = StorageManager(empty_storage_manager_config)
         try:
-            with pytest.raises(ValueError, match="not a LendingL2Adapter"):
+            with pytest.raises(ValueError, match="not a LendingPeerL2AdapterBase"):
                 sm.add_l2_adapter(
                     NonLendingMockL2AdapterConfig(
                         max_size_gb=0.01, mock_bandwidth_gb=10.0
                     )
                 )
-            serde = LendingMockL2AdapterConfig(max_size_gb=0.01, mock_bandwidth_gb=10.0)
+            serde = LendingMockL2AdapterConfig()
             serde.serde_config = SerdeConfig(type="fp8")
             with pytest.raises(ValueError, match="serde"):
                 sm.add_l2_adapter(serde)
             status = sm.report_status()
             assert status["num_l2_adapters"] == 0
             assert set(status["l1_managers"]) == {"_default"}
-            adapter_id = sm.add_l2_adapter(
-                LendingMockL2AdapterConfig(max_size_gb=0.01, mock_bandwidth_gb=10.0)
-            )
+            adapter_id = sm.add_l2_adapter(LendingMockL2AdapterConfig())
             assert f"shadow.dram.{adapter_id}" in sm.report_status()["l1_managers"]
         finally:
             sm.close()
@@ -525,9 +521,7 @@ class TestStorageManagerRuntimeAdapters:
         sm = StorageManager(empty_storage_manager_config)
         try:
             assert "l1_manager" in sm.report_status()
-            adapter_id = sm.add_l2_adapter(
-                LendingMockL2AdapterConfig(max_size_gb=0.01, mock_bandwidth_gb=10.0)
-            )
+            adapter_id = sm.add_l2_adapter(LendingMockL2AdapterConfig())
             status = sm.report_status()
             assert "l1_manager" not in status
             assert len(status["l1_managers"]) == 2

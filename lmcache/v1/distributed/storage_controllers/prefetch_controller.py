@@ -46,7 +46,9 @@ from lmcache.v1.distributed.error import L1Error
 from lmcache.v1.distributed.internal_api import L1ManagerInterface
 from lmcache.v1.distributed.l1_manager import ShadowL1Manager
 from lmcache.v1.distributed.l2_adapters.base import L2AdapterInterface, L2TaskId
-from lmcache.v1.distributed.l2_adapters.lending import LendingL2Adapter
+from lmcache.v1.distributed.l2_adapters.p2p_l2_adapter import (
+    LendingPeerL2AdapterBase,
+)
 from lmcache.v1.distributed.storage_controller import StorageControllerInterface
 from lmcache.v1.distributed.storage_controllers.adapter_lifecycle import (
     AddAdapterOp,
@@ -475,12 +477,14 @@ class InFlightPrefetchRequest:
         return not self.inflight_load_tasks
 
 
-def _require_lender(adapter_id: int, adapter: L2AdapterInterface) -> LendingL2Adapter:
+def _require_lender(
+    adapter_id: int, adapter: L2AdapterInterface
+) -> LendingPeerL2AdapterBase:
     """Return ``adapter`` as a lender; raise ValueError if it is not one."""
-    if not isinstance(adapter, LendingL2Adapter):
+    if not isinstance(adapter, LendingPeerL2AdapterBase):
         raise ValueError(
             f"L2 adapter {adapter_id} brought a shadow L1 but does not lend views "
-            "(not a LendingL2Adapter)"
+            "(not a LendingPeerL2AdapterBase)"
         )
     return adapter
 
@@ -544,7 +548,7 @@ class PrefetchController(StorageControllerInterface):
         }
         # Lending adapter id -> the shadow L1 it brought / the adapter as lender.
         self._shadow_l1s: dict[int, ShadowL1Manager] = {}
-        self._lenders: dict[int, LendingL2Adapter] = {}
+        self._lenders: dict[int, LendingPeerL2AdapterBase] = {}
         self._shadow_l1_ids: set[int] = set()
 
         self._l2_adapters: dict[int, L2AdapterInterface] = {

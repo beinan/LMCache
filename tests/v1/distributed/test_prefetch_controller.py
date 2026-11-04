@@ -1997,9 +1997,7 @@ def make_lender(
     shadow = ShadowL1Manager.for_lender(
         adapter_id, MemorySegment.DRAM, l1_manager.config
     )
-    adapter = LendingMockL2Adapter(
-        LendingMockL2AdapterConfig(max_size_gb=0.01, mock_bandwidth_gb=10.0)
-    )
+    adapter = LendingMockL2Adapter(LendingMockL2AdapterConfig())
     return shadow, adapter
 
 
@@ -2020,9 +2018,7 @@ def make_borrowing_controller(
         adapter_descriptors=[
             L2AdapterDescriptor(
                 index=0,
-                config=LendingMockL2AdapterConfig(
-                    max_size_gb=0.01, mock_bandwidth_gb=10.0
-                ),
+                config=LendingMockL2AdapterConfig(),
             )
         ],
         policy=DefaultPrefetchPolicy(),
@@ -2039,7 +2035,7 @@ class TestBorrowing:
         copier = make_adapter()
         lender_desc = L2AdapterDescriptor(
             index=0,
-            config=LendingMockL2AdapterConfig(max_size_gb=0.01, mock_bandwidth_gb=10.0),
+            config=LendingMockL2AdapterConfig(),
         )
         l1_desc = L1ManagerDescriptor(
             index=l1_manager.l1_manager_id, config=l1_manager.config
@@ -2087,9 +2083,7 @@ class TestBorrowing:
                 adapter,
                 L2AdapterDescriptor(
                     index=1,
-                    config=LendingMockL2AdapterConfig(
-                        max_size_gb=0.01, mock_bandwidth_gb=10.0
-                    ),
+                    config=LendingMockL2AdapterConfig(),
                 ),
                 shadow_l1=shadow,
             )

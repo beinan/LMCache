@@ -1,16 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
-"""A mock L2 adapter that lends views; importing registers ``lending_mock``.
+"""A lending peer adapter over an in-memory fake owner, registered as
+``lending_mock``.
 
-It is a ``LendingL2Adapter`` without being a ``PeerL2AdapterBase``, so
-controller tests need no transport. ``NonLendingMockL2AdapterConfig``
-(``nonlending_mock``) wants a ``REMOTE`` L1 but builds a plain mock, to test
-that a shadow L1 is refused to anything but a lender.
+``LendingMockL2Adapter`` is a real ``LendingPeerL2AdapterBase``: lookups,
+locks and unlocks go through the peer base's RPC path to ``_FakeOwner``, which
+stores tensors and counts locks, so controller and storage-manager tests need
+no transport. ``NonLendingMockL2AdapterConfig`` (``nonlending_mock``) wants a
+``REMOTE`` L1 but builds a plain mock, to test that a shadow L1 is refused to
+anything but a lender.
 """
 
 # Standard
 from typing import Optional
+from unittest.mock import MagicMock, patch
 
 # First Party
+from lmcache.lmcache_native import Bitmap
 from lmcache.v1.distributed.api import (
     MemoryLayoutDesc,
     MemoryResidency,
@@ -19,57 +24,166 @@ from lmcache.v1.distributed.api import (
     ObjectKey,
 )
 from lmcache.v1.distributed.internal_api import L1MemoryDesc
+from lmcache.v1.distributed.l2_adapters import p2p_l2_adapter as p2p_mod
 from lmcache.v1.distributed.l2_adapters.base import L2AdapterInterface, L2TaskId
 from lmcache.v1.distributed.l2_adapters.config import (
     L2AdapterConfigBase,
     register_l2_adapter_type,
 )
 from lmcache.v1.distributed.l2_adapters.factory import register_l2_adapter_factory
-from lmcache.v1.distributed.l2_adapters.lending import LendingL2Adapter
 from lmcache.v1.distributed.l2_adapters.mock_l2_adapter import (
     MockL2Adapter,
     MockL2AdapterConfig,
 )
-from lmcache.v1.memory_management import BorrowedTensorMemoryObj
+from lmcache.v1.distributed.l2_adapters.p2p_l2_adapter import (
+    LendingPeerL2AdapterBase,
+    PeerL2AdapterConfigBase,
+)
+from lmcache.v1.distributed.transfer_channel.api import TransferChannelAddress
+from lmcache.v1.memory_management import BorrowedTensorMemoryObj, MemoryObj
 
 
-class LendingMockL2AdapterConfig(MockL2AdapterConfig):
-    """Config for a mock adapter that lends views of a peer's DRAM.
+class LendingMockL2AdapterConfig(PeerL2AdapterConfigBase):
+    """Config of the lending mock; the peer URL is never dialed."""
 
-    It wants a ``(DRAM, REMOTE)`` L1, so the storage manager gives it a
-    shadow L1 instead of binding it to a local L1.
-    """
+    def __init__(self, lookup_timeout_s: float = 10.0) -> None:
+        super().__init__("tcp://fake-owner:0", lookup_timeout_s)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "LendingMockL2AdapterConfig":
+        return cls(lookup_timeout_s=float(d.get("lookup_timeout_s", 10.0)))
+
+    @classmethod
+    def help(cls) -> str:
+        return "Lending mock adapter config: lookup_timeout_s (float, optional)"
 
     def get_wanted_l1_memory_tags(self) -> tuple[MemoryTags, ...]:
         return (MemoryTags(MemorySegment.DRAM, MemoryResidency.REMOTE),)
 
 
-class NonLendingMockL2AdapterConfig(LendingMockL2AdapterConfig):
+class NonLendingMockL2AdapterConfig(MockL2AdapterConfig):
     """Wants a REMOTE L1 like a lender, but its adapter cannot lend."""
 
+    def get_wanted_l1_memory_tags(self) -> tuple[MemoryTags, ...]:
+        return (MemoryTags(MemorySegment.DRAM, MemoryResidency.REMOTE),)
 
-class LendingMockL2Adapter(MockL2Adapter, LendingL2Adapter):
-    """Mock adapter that lends views of its stored objects .
 
-    A view's lease is the key's lookup lock: ending it unlocks the key.
-    ``lookup_count`` counts lookups, so a test can assert that a request
-    never consulted the lender; ``touch_count`` counts reader hits on its
-    views; ``get_active_borrow_count`` counts views whose lease has not
-    ended, so adapter removal drains them first.
+class _Future:
+    def __init__(self, value: object) -> None:
+        self._value = value
+
+    def result(self, timeout: float | None = None) -> object:
+        return self._value
+
+
+class _FakeOwner:
+    """The peer's request server: stores tensors, counts read locks."""
+
+    def __init__(self) -> None:
+        self.objects: dict[ObjectKey, MemoryObj] = {}
+        self.locks: dict[ObjectKey, int] = {}
+        self._lookups: dict[int, list[ObjectKey]] = {}
+        self._next_task = 0
+
+    def p2p_lookup_and_lock(
+        self, keys: list[ObjectKey], group_layout_descs: dict[int, MemoryLayoutDesc]
+    ) -> _Future:
+        task_id = self._next_task
+        self._next_task += 1
+        self._lookups[task_id] = keys
+        return _Future(task_id)
+
+    def p2p_query_lookup_results(self, task_id: int) -> _Future:
+        addresses = []
+        for i, key in enumerate(self._lookups.pop(task_id)):
+            obj = self.objects.get(key)
+            if obj is None:
+                addresses.append(TransferChannelAddress(offset=-1, size=0))
+            else:
+                self.locks[key] = self.locks.get(key, 0) + 1
+                addresses.append(TransferChannelAddress(offset=i, size=obj.get_size()))
+        return _Future(addresses)
+
+    def p2p_unlock_objects(self, keys: list[ObjectKey]) -> _Future:
+        for key in keys:
+            if self.locks.get(key, 0) > 1:
+                self.locks[key] -= 1
+            else:
+                self.locks.pop(key, None)
+        return _Future(None)
+
+    def close(self) -> None:
+        pass
+
+
+class LendingMockL2Adapter(LendingPeerL2AdapterBase):
+    """Lends views of the fake owner's tensors; a view's lease is its lock.
+
+    ``lookup_count`` counts lookups, ``touch_count`` reader hits on views,
+    and ``get_active_borrow_count`` views whose lease has not ended, so
+    adapter removal drains them first.
     """
 
-    def __init__(self, config: MockL2AdapterConfig) -> None:
-        super().__init__(config)
+    def __init__(self, config: LendingMockL2AdapterConfig) -> None:
+        self._owner = _FakeOwner()
+        self._found: dict[L2TaskId, set[ObjectKey]] = {}
         self._lent: dict[L2TaskId, set[ObjectKey]] = {}
         self._live_views = 0
         self.lookup_count = 0
         self.touch_count = 0
+        with (
+            patch.object(
+                p2p_mod.RequestClientFactory, "create", return_value=self._owner
+            ),
+            patch.object(p2p_mod, "PeriodicEventNotifier") as notifier,
+        ):
+            notifier.get.return_value = MagicMock()
+            super().__init__(config)
+
+    # -- test helpers -------------------------------------------------------
+
+    def debug_has_key(self, key: ObjectKey) -> bool:
+        return key in self._owner.objects
+
+    def debug_get_locked_key_count(self) -> int:
+        return len(self._owner.locks)
+
+    # -- store: the fake owner keeps the bytes -------------------------------
+
+    def submit_store_task(
+        self, keys: list[ObjectKey], objects: list[MemoryObj]
+    ) -> L2TaskId:
+        for key, obj in zip(keys, objects, strict=True):
+            self._owner.objects[key] = obj
+        return super().submit_store_task(keys, objects)
+
+    # -- lookup: the peer base's RPC path, plus an immediate wake-up ----------
 
     def submit_lookup_and_lock_task(
         self, keys: list[ObjectKey], group_layout_descs: dict[int, MemoryLayoutDesc]
     ) -> L2TaskId:
         self.lookup_count += 1
-        return super().submit_lookup_and_lock_task(keys, group_layout_descs)
+        task_id = super().submit_lookup_and_lock_task(keys, group_layout_descs)
+        self._lookup_efd.notify()
+        return task_id
+
+    def query_lookup_and_lock_result(self, task_id: L2TaskId) -> Bitmap | None:
+        self._current_task = task_id
+        return super().query_lookup_and_lock_result(task_id)
+
+    def _process_lookup_result(
+        self, keys: list[ObjectKey], addresses: list[TransferChannelAddress]
+    ) -> Bitmap:
+        bitmap = Bitmap(len(keys))
+        found = set()
+        for i, (key, address) in enumerate(zip(keys, addresses, strict=True)):
+            if address.is_valid():
+                bitmap.set(i)
+                found.add(key)
+        self._found[self._current_task] = found
+        return bitmap
+
+    # -- lending ------------------------------------------------------------
 
     def take_borrowed_objects(
         self,
@@ -77,10 +191,12 @@ class LendingMockL2Adapter(MockL2Adapter, LendingL2Adapter):
         keys: list[ObjectKey],
         layouts: dict[int, MemoryLayoutDesc],
     ) -> dict[ObjectKey, BorrowedTensorMemoryObj]:
-        self._lent[task_id] = set(keys)
+        found = self._found.pop(task_id, set())
         views = {}
         for key in keys:
-            stored = self._memory_objects[key]
+            if key not in found:
+                continue
+            stored = self._owner.objects[key]
             ended: list[bool] = []
             self._live_views += 1
 
@@ -103,6 +219,7 @@ class LendingMockL2Adapter(MockL2Adapter, LendingL2Adapter):
                 on_release=end_lease,
                 on_touch=touched,
             )
+        self._lent[task_id] = set(views)
         return views
 
     def release_lookup(self, task_id: L2TaskId, keys: list[ObjectKey]) -> None:
@@ -111,6 +228,23 @@ class LendingMockL2Adapter(MockL2Adapter, LendingL2Adapter):
 
     def get_active_borrow_count(self) -> int:
         return self._live_views
+
+    # -- the rest of the peer contract --------------------------------------
+
+    def submit_load_task(self, keys: list[ObjectKey], objects: list[MemoryObj]):
+        raise NotImplementedError("a lender never loads")
+
+    def query_load_result(self, task_id: L2TaskId) -> Bitmap | None:
+        raise NotImplementedError("a lender never loads")
+
+    def get_memory_tags(self) -> MemoryTags:
+        return MemoryTags(MemorySegment.DRAM, MemoryResidency.REMOTE)
+
+    def _register_peer_region(self) -> None:
+        pass
+
+    def _unregister_peer_region(self) -> None:
+        pass
 
 
 def _create_lending_mock_adapter(

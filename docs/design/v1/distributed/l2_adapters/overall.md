@@ -141,7 +141,7 @@ get_wanted_l1_memory_tags() -> tuple[MemoryTags, ...]  # adapter config
   adapter; override it only for adapters that need a different L1.
 - The storage manager picks the adapter's L1 from these tags before building
   the adapter. An adapter whose first wanted tags are `REMOTE` is a lender
-  (`LendingL2Adapter`, `l2_adapters/lending.py`): it gets a shadow L1 of its
+  (`LendingPeerL2AdapterBase`, `l2_adapters/p2p_l2_adapter.py`): it gets a shadow L1 of its
   own instead, and the prefetch controller admits the views it lends there
   (`../l1_manager/l1-manager-types.md`, "Shadow L1"). See `../memory_tags.md`
   for the rules and the scope restriction.

@@ -106,7 +106,7 @@ indexes. An L2 adapter that lends a peer's bytes instead of copying them
 needs an L1 that indexes bytes it does not own: `ShadowL1Manager`.
 
 ```text
-LendingL2Adapter                           ShadowL1Manager (metadata only)
+LendingPeerL2AdapterBase                   ShadowL1Manager (metadata only)
   take_borrowed_objects(task, keys) ────►  admit({key: view}, read_locks)
   -> BorrowedTensorMemoryObj per key        resident + read-locked, 0 bytes
        is_valid(): lease still holds        ...ordinary readers...
@@ -115,16 +115,16 @@ LendingL2Adapter                           ShadowL1Manager (metadata only)
                                               reap_expired, release_all)
 ```
 
-- **Only with a lender.** `LendingL2Adapter` (`l2_adapters/lending.py`)
-  declares `take_borrowed_objects`, `release_lookup` and
-  `get_active_borrow_count`; a production lender is a peer adapter deriving
-  from `PeerL2AdapterBase` and it. It wants a `REMOTE` L1 first
-  (`borrowed_segment(config)`) and maps peer memory itself, like P2P, so a
-  shadow is never configured and needs no size or device.
+- **Only with a lending peer adapter.** `LendingPeerL2AdapterBase`
+  (`l2_adapters/p2p_l2_adapter.py`) declares `take_borrowed_objects`,
+  `release_lookup` and `get_active_borrow_count` on top of the peer RPC
+  control plane. It wants a `REMOTE` L1 first (`borrowed_segment(config)`)
+  and maps peer memory itself, like P2P, so a shadow is never configured and
+  needs no size or device.
 - **Lifetime.** `StorageManager._build_l2_adapter` creates
   `ShadowL1Manager.for_lender(adapter_id, segment, defaults)` for a lender
   (tag `shadow.<segment>.<adapter_id>`, default lock TTLs), refusing serde or
-  a non-`LendingL2Adapter` before anything is registered and rolling back a
+  a non-`LendingPeerL2AdapterBase` before anything is registered and rolling back a
   later failure. The prefetch controller takes the shadow as the adapter's
   L1 affinity. `delete_l2_adapter` drains the lender, which waits for every
   lent view (`get_active_borrow_count`), then closes the shadow; `close()`

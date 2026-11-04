@@ -191,7 +191,7 @@ preferred matching tags. Stores and serde use that L1, and prefetch reloads
 allocate there. There is no pluggable affinity policy. An adapter that no L1
 matches, such as a host-buffer adapter in a GDS-only server, is rejected. An
 adapter that wants a `REMOTE` L1 first is a lender: it must be a
-`LendingL2Adapter` without serde, and instead of resolving tags it gets a
+`LendingPeerL2AdapterBase` without serde, and instead of resolving tags it gets a
 shadow L1 of its own as its affinity. Runtime adapter attachment updates the
 controller's mapping on its own loop thread; removal drops it after draining,
 which for a lender includes every view it lent.
