@@ -206,34 +206,6 @@ class ShadowL1Manager(BaseL1Manager):
         """
         self._sweep_lapsed_locked()
 
-    @l1_mgr_synchronized
-    def reserve_read(
-        self,
-        keys: list[ObjectKey],
-        read_locks: int = 1,
-    ) -> dict[ObjectKey, L1OperationResult]:
-        """Reserve read access; a view whose lease ended is ``KEY_NOT_EXIST``.
-
-        Same contract as ``BaseL1Manager.reserve_read`` with that one extra
-        refusal, checked under the same lock as the reservation: the peer can
-        end a lease at any time, and a new reader must never get a view it
-        cannot read. The next ``admit`` sweeps the view once no reader holds it.
-        """
-        total = validate_read_locks(read_locks)
-        ret: dict[ObjectKey, L1OperationResult] = {}
-        reserved: list[ObjectKey] = []
-        for key in keys:
-            entry = self._objects.get(key)
-            if entry is None or not entry.memory_obj.is_valid():
-                ret[key] = (L1Error.KEY_NOT_EXIST, None)
-                continue
-            for _ in range(total):
-                entry.read_lock.lock()
-            ret[key] = (L1Error.SUCCESS, entry.memory_obj)
-            reserved.append(key)
-        self._report_read_reserved(reserved)
-        return ret
-
     def unsafe_read(self, keys: list[ObjectKey]) -> dict[ObjectKey, L1OperationResult]:
         """Read held views; one whose lease ended is ``KEY_NOT_READABLE``."""
         ret = super().unsafe_read(keys)

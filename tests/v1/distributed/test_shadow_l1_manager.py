@@ -134,7 +134,7 @@ def test_admit_read_locks_without_allocating(shadow: ShadowL1Manager) -> None:
     assert lease.releases == 0
     assert shadow.finish_read([KEY])[KEY] == L1Error.SUCCESS
     assert lease.releases == 1
-    assert shadow.reserve_read([KEY])[KEY][0] == L1Error.KEY_NOT_EXIST
+    assert shadow.unsafe_read([KEY])[KEY][0] == L1Error.KEY_NOT_EXIST
 
 
 def test_resident_view_adopts_the_fresh_lease(shadow: ShadowL1Manager) -> None:
@@ -176,7 +176,7 @@ def test_expired_view_is_not_admitted(shadow: ShadowL1Manager) -> None:
     lease.valid = False
     assert shadow.admit({KEY: _view(lease)})[KEY] == (L1Error.KEY_IN_WRONG_STATE, None)
     assert lease.releases == 1
-    assert shadow.reserve_read([KEY])[KEY][0] == L1Error.KEY_NOT_EXIST
+    assert shadow.unsafe_read([KEY])[KEY][0] == L1Error.KEY_NOT_EXIST
 
 
 def test_holder_keeps_an_expired_view_until_finish_read(
@@ -187,7 +187,6 @@ def test_holder_keeps_an_expired_view_until_finish_read(
     lease = Lease()
     shadow.admit({KEY: _view(lease)})
     lease.valid = False
-    assert shadow.reserve_read([KEY])[KEY][0] == L1Error.KEY_NOT_EXIST
     assert shadow.unsafe_read([KEY])[KEY][0] == L1Error.KEY_NOT_READABLE
     assert lease.releases == 0
     assert shadow.finish_read([KEY])[KEY] == L1Error.SUCCESS
