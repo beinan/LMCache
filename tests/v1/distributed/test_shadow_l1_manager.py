@@ -32,6 +32,8 @@ from lmcache.v1.distributed.memory_manager import (
     ShadowL1MemoryManager,
 )
 from lmcache.v1.memory_management import MemoryFormat, MemoryObjMetadata
+from lmcache.v1.mp_observability.event import Event, EventType
+from lmcache.v1.mp_observability.event_bus import EventBusConfig, init_event_bus
 import lmcache.v1.memory_management as memory_management
 
 pytestmark = pytest.mark.no_shared_allocator
@@ -260,3 +262,36 @@ def test_admit_replaces_a_stale_unheld_view(shadow_1s: ShadowL1Manager) -> None:
     assert stale.releases == 1
     assert fresh.releases == 0
     assert shadow_1s.unsafe_read([KEY])[KEY] == (L1Error.SUCCESS, view)
+
+
+def test_shadow_publishes_no_l1_events(fake_pinned_memory: None) -> None:
+    """A shadow's keys are the peer's residency: none of admit, read, finish,
+    delete or close publishes an L1 event, while the owned L1 built from the
+    same config still does."""
+    bus = init_event_bus(EventBusConfig(enabled=True, max_queue_size=10_000))
+    events: list[Event] = []
+    for event_type in EventType:
+        if event_type.name.startswith("L1_"):
+            bus.subscribe(event_type, events.append)
+    bus.start()
+    try:
+        manager, local = _shadow()
+        try:
+            lease = Lease()
+            assert manager.admit({KEY: _view(lease)})[KEY][0] == L1Error.SUCCESS
+            manager.unsafe_read([KEY])
+            manager.finish_read([KEY])
+            manager.admit({KEY: _view(Lease())})
+            manager.delete([KEY], force=True)
+            manager.close()
+            local.reserve_write([KEY], [False], LAYOUT)
+            local.finish_write([KEY])
+        finally:
+            manager.close()
+            local.close()
+        bus.stop()
+        tags = {event.metadata["l1_tag"] for event in events}
+        assert local.config.tag in tags
+        assert manager.config.tag not in tags
+    finally:
+        init_event_bus(EventBusConfig(enabled=False))

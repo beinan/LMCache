@@ -127,10 +127,11 @@ lender ── take_borrowed_objects ──► views ── admit ──► shado
   A key already resident keeps its view, which adopts the fresh lease when
   both are views of the same bytes; the older reservation goes back. A fresh
   view of other bytes is released and the key is a miss for that request.
-- **A read must finish within the owner's TTL.** An ended lease refuses new
-  readers; a holder keeps its view until `finish_read`. An entry whose
-  readers' TTL lapsed is swept at the next `admit`, and while its lender
-  drains (`sweep_lapsed`).
+- **A read must finish within the owner's TTL.** An ended lease makes the
+  view `KEY_NOT_READABLE` to `unsafe_read`, the one way a shadow is read;
+  a holder keeps its view until `finish_read`. An entry whose readers' TTL
+  lapsed is swept at the next `admit`, and while its lender drains
+  (`sweep_lapsed`), so removing a lender can take up to that TTL.
 - **Only `LOCK` prefetches borrow.** A warm request keeps no read lock, and a
   view lives only while read-locked.
 - **Status.** Tags are `(segment, REMOTE)`, so P2P never re-exports a view.

@@ -1187,7 +1187,13 @@ class StorageManager:
                         )
                     )
                 for done in drained:
-                    done.wait(timeout=_ROLLBACK_DRAIN_TIMEOUT_S)
+                    if not done.wait(timeout=_ROLLBACK_DRAIN_TIMEOUT_S):
+                        logger.warning(
+                            "L2 adapter %d still held by a controller after %.0fs; "
+                            "closing it anyway",
+                            adapter_id,
+                            _ROLLBACK_DRAIN_TIMEOUT_S,
+                        )
                 self._detach_shadow(adapter_id)
                 adapter.close()
                 raise
@@ -1211,7 +1217,8 @@ class StorageManager:
             ValueError: If no adapter with ``adapter_id`` is active.
             TimeoutError: If draining did not complete within ``timeout``;
                 the adapter is left active (draining) so the caller can
-                retry.
+                retry. A lender drains once its readers finish or their
+                read-lock TTL lapses, so its removal may need that long.
             Exception: Whatever the adapter's ``close`` raises. By then the
                 controllers and the L2 eviction state have already dropped
                 the adapter and it is no longer active (``l2_adapters``,
@@ -1641,7 +1648,9 @@ class StorageManager:
                 adapter.close()
                 raise ValueError(
                     f"L2 adapter {adapter_id}: a shadow L1 needs a "
-                    "LendingPeerL2AdapterBase whose config wants a REMOTE L1 first"
+                    "LendingPeerL2AdapterBase whose config wants a REMOTE L1 first "
+                    f"(lends: {isinstance(adapter, LendingPeerL2AdapterBase)}, "
+                    f"REMOTE first: {segment is not None})"
                 )
         except Exception:
             if segment is not None:

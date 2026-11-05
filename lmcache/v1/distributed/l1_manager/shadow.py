@@ -4,7 +4,7 @@
 # Standard
 from collections.abc import Mapping
 from dataclasses import replace
-from typing import cast
+from typing import Any, cast
 
 # First Party
 from lmcache import torch_dev
@@ -30,6 +30,8 @@ from lmcache.v1.distributed.memory_manager import (
     ShadowL1MemoryManager,
 )
 from lmcache.v1.memory_management import MemoryObj
+from lmcache.v1.mp_observability.event import Event, EventType
+from lmcache.v1.mp_observability.event_bus import EventBus, EventBusConfig
 
 # The L1 medium a borrowed segment is reported as; other segments cannot be
 # borrowed.
@@ -38,6 +40,27 @@ _BACKEND_BY_SEGMENT: dict[MemorySegment, L1BackendType] = {
     MemorySegment.CXL: L1BackendType.DEVDAX,
     MemorySegment.GDS: L1BackendType.GDS,
 }
+
+
+class _NoEvents(EventBus):
+    """An event bus that publishes nothing.
+
+    L1 events announce this node's residency per backend, and a shadow's keys
+    are the peer's residency: an eviction event from a DRAM shadow would be
+    recorded against this node's own DRAM copy of the key.
+    """
+
+    def __init__(self) -> None:
+        self._config = EventBusConfig(enabled=False)
+
+    def publish(self, event: Event) -> None:
+        pass
+
+    def publish_on_stream(self, stream: Any, event: Event) -> None:
+        pass
+
+    def has_subscribers(self, event_type: EventType) -> bool:
+        return False
 
 
 class ShadowL1Manager(BaseL1Manager):
@@ -52,9 +75,11 @@ class ShadowL1Manager(BaseL1Manager):
     A view is admitted for one request's readers. Every request looks the
     lender up, so a key already resident adopts the newer lease while its
     holders keep reading, and the older reservation goes back. A view whose
-    lease ended is never handed to a new reader; a holder keeps it until its
-    last ``finish_read``, so a read must finish within the owner's TTL. An
-    entry whose readers' TTL lapsed is swept at the next ``admit``.
+    lease ended answers ``KEY_NOT_READABLE`` to ``unsafe_read``, the one way
+    a shadow is read (prefetch reserves from owned L1s only); a holder keeps
+    it until its last ``finish_read``, so a read must finish within the
+    owner's TTL. An entry whose readers' TTL lapsed is swept at the next
+    ``admit``. No L1 event is published for a shadow.
     """
 
     def __init__(
@@ -76,6 +101,7 @@ class ShadowL1Manager(BaseL1Manager):
             segment=segment, residency=MemoryResidency.REMOTE
         )
         super().__init__(config, ShadowL1MemoryManager())
+        self._event_bus = _NoEvents()
 
     @classmethod
     def for_lender(
@@ -218,16 +244,21 @@ class ShadowL1Manager(BaseL1Manager):
         """Release every view, read-locked or not; idempotent.
 
         Call after stopping new controller and GPU submissions; outstanding
-        work on every device a view lives on is synchronized first so no
-        copy reads a released view.
+        work is synchronized first so no copy reads a released view: on the
+        devices the views live on, or on every device when a host view may
+        have been read by any GPU.
         """
         with self._lock:
             devices = {
                 entry.memory_obj.raw_data.device for entry in self._objects.values()
             }
-        for device in devices:
-            if device.type != "cpu":
-                torch_dev.synchronize(device.index)
+        if torch_dev.is_available():
+            if any(device.type == "cpu" for device in devices):
+                indices = list(range(torch_dev.device_count()))
+            else:
+                indices = [device.index for device in devices]
+            for index in indices:
+                torch_dev.synchronize(index)
         super().close()
 
     def _object_meta(self, memory_obj: MemoryObj) -> L1ObjectMeta:
