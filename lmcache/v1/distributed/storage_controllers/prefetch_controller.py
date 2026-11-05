@@ -1056,8 +1056,8 @@ class PrefetchController(StorageControllerInterface):
         Note:
             Membership in ``l2_locked_keys`` keeps an adapter attached until
             the request has returned its L2 read locks; the entry is removed
-            when the adapter's load result is admitted. A lender stays
-            until every view it lent is released.
+            when the adapter's load result is admitted; a lender stays
+            until its lent views are released.
         """
         shadow = self._shadow_l1s.get(adapter_id)
         if shadow is not None:
@@ -1556,8 +1556,7 @@ class PrefetchController(StorageControllerInterface):
 
         Returns:
             ``True`` if the adapter is not draining, its memory tags are
-            allowed by the request, and it does not lend views to a
-            ``NO_LOCK`` request (a lent view lives only while read-locked).
+            allowed by the request, and it is not a lender under ``NO_LOCK``.
         """
         if request.lock_mode == PrefetchLockMode.NO_LOCK and l2_idx in self._shadow_l1s:
             return False
@@ -1608,11 +1607,9 @@ class PrefetchController(StorageControllerInterface):
     def _admit_borrowed_views(self, request: InFlightPrefetchRequest) -> None:
         """Move each lender's planned keys into its shadow L1 as borrowed views.
 
-        A lender copies nothing: the views it hands over are admitted into
-        its shadow L1, read-locked for the request, and leave the L2 plan
-        without reserving destination capacity. Only keys that did not
-        become views are unlocked; a view owns its reservation, so another
-        request's reservation of the same key is never returned here.
+        The views are admitted into the lender's shadow L1, read-locked for
+        the request, and leave the L2 plan; only keys that became no view
+        are unlocked, since a view owns its reservation.
         """
         states = request.key_states
         layouts = {

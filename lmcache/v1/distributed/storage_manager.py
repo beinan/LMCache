@@ -104,8 +104,7 @@ from lmcache.v1.platform import HAS_EVENTFD
 
 logger = init_logger(__name__)
 
-# How long a failed add_l2_adapter waits for the controllers to drop the adapter.
-_ROLLBACK_DRAIN_TIMEOUT_S = 30.0
+_ROLLBACK_DRAIN_TIMEOUT_S = 30.0  # a failed add_l2_adapter waits this long to undo
 
 # L1 write tag for every object reserved through this manager. Sharing one
 # tag makes concurrent stores of the same key exclude each other.
@@ -155,9 +154,8 @@ class StorageManager:
         with ExitStack() as cleanup:
             self._event_bus = get_event_bus()
 
-            # L1 Managers: the configured ones own memory; a lending L2 adapter
-            # brings a shadow L1 (_build_l2_adapter). The L1 containers are
-            # replaced, never mutated, so other threads read a snapshot.
+            # L1 Managers: configured ones own memory; a lending L2 adapter adds
+            # a shadow L1. The containers are replaced, never mutated.
             self._owned_l1_managers: list[L1ManagerInterface] = create_l1_managers(
                 config.l1_manager_configs
             )
@@ -322,7 +320,6 @@ class StorageManager:
             ValueError: The write policy selected an unregistered L1 manager
                 or did not place every key exactly once.
         """
-        # Shadow L1s hold borrowed views only, so writes go to owned L1s.
         targets = self._write_policy.select_write_targets(keys, self._owned_l1_managers)
         _validate_write_targets(keys, targets, self._l1_managers_by_id)
         reserve_result: dict[ObjectKey, L1OperationResult] = {}
@@ -1128,10 +1125,10 @@ class StorageManager:
             ValueError: If no L1 has the memory tags the adapter wants, the
                 adapter registers a single L1 memory region while its L1 spans
                 more than one Device-DAX arena, a DAX device is already
-                mapped by L1 or another L2 adapter, or a ``REMOTE``-wanting
-                adapter is not a lending one (see ``_build_l2_adapter``).
-            RuntimeError: If a controller did not attach the adapter in time.
-                The adapter is then closed and nothing stays registered.
+                mapped by L1 or another L2 adapter, or a lender and its config
+                disagree (see ``_build_l2_adapter``).
+            RuntimeError: If a controller did not attach the adapter in time;
+                the registration is undone.
         """
         with self._lifecycle_lock:
             # Mirror of the check in add_l1_devdax_device: a single-region
@@ -1176,12 +1173,9 @@ class StorageManager:
                         )
                     )
             except Exception:
-                # Leave nothing half-registered: both controllers drop the
-                # adapter (a queued add applies first, then the remove), and
-                # only then are the adapter and its shadow L1 closed.
-                logger.exception(
-                    "Adding L2 adapter %d failed; rolling back", adapter_id
-                )
+                # Both controllers drop the adapter (a queued add applies first)
+                # before it and its shadow L1 are closed.
+                logger.exception("Adding L2 adapter %d failed; undoing", adapter_id)
                 with self._adapters_lock:
                     self._l2_adapters.pop(adapter_id, None)
                     self._adapter_descriptors.pop(adapter_id, None)
@@ -1193,12 +1187,7 @@ class StorageManager:
                         )
                     )
                 for done in drained:
-                    if not done.wait(timeout=_ROLLBACK_DRAIN_TIMEOUT_S):
-                        logger.warning(
-                            "L2 adapter %d not drained within %.0fs during rollback",
-                            adapter_id,
-                            _ROLLBACK_DRAIN_TIMEOUT_S,
-                        )
+                    done.wait(timeout=_ROLLBACK_DRAIN_TIMEOUT_S)
                 self._detach_shadow(adapter_id)
                 adapter.close()
                 raise
@@ -1262,9 +1251,7 @@ class StorageManager:
                         "controller"
                     )
                 self._l2_eviction_controller.remove_adapter_state(adapter_id)
-                # The prefetch drain waited for every borrowed view; the
-                # lender closes its shadow L1 with itself.
-                self._detach_shadow(adapter_id)
+                self._detach_shadow(adapter_id)  # its views drained with prefetch
                 # From here the adapter is detached: not active, but kept in
                 # the registry until its close succeeds.
                 with self._adapters_lock:
@@ -1632,15 +1619,9 @@ class StorageManager:
             instance, and ``descriptor`` is its descriptor carrying that id.
 
         Raises:
-            ValueError: If no L1 has the memory tags the adapter wants; or the
-                adapter wants a ``REMOTE`` L1 but is not a
-                :class:`LendingPeerL2AdapterBase`, or is one but does not want
-                a ``REMOTE`` L1 first, uses serde, or borrows a segment no L1
-                medium backs.
-
-        Note:
-            A lending adapter maps peer memory itself; it gets a shadow L1
-            created here and bound to it, which it closes with itself.
+            ValueError: If no L1 has the memory tags the adapter wants; or a
+                :class:`LendingPeerL2AdapterBase` and a ``REMOTE``-first config
+                do not come together, with serde, or for a segment no L1 backs.
         """
         segment = borrowed_segment(config)
         if segment is not None and config.serde_config is not None:
@@ -1656,18 +1637,11 @@ class StorageManager:
             adapter: L2AdapterInterface = create_l2_adapter(
                 config, manager.get_l1_memory_desc()
             )
-            lends = isinstance(adapter, LendingPeerL2AdapterBase)
-            if lends != (segment is not None):
+            if isinstance(adapter, LendingPeerL2AdapterBase) != (segment is not None):
                 adapter.close()
                 raise ValueError(
-                    f"L2 adapter {adapter_id} "
-                    + (
-                        "is a LendingPeerL2AdapterBase but does not want a REMOTE "
-                        "L1 first"
-                        if lends
-                        else "wants a REMOTE L1 but is not a LendingPeerL2AdapterBase"
-                    )
-                    + "; a shadow L1 is supported only with one"
+                    f"L2 adapter {adapter_id}: a shadow L1 needs a "
+                    "LendingPeerL2AdapterBase whose config wants a REMOTE L1 first"
                 )
         except Exception:
             if segment is not None:
