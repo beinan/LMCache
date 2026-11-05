@@ -25,8 +25,10 @@ class BorrowedTensorMemoryObj(TensorMemoryObj):
         metadata: Layout of the object.
         lease_is_valid: Nonblocking check that the lease still holds.
         on_release: Ends the lease; idempotent, nonblocking, and takes no lock
-            the caller might hold. It runs under the L1 manager's lock, so it
-            must never call back into an L1 manager.
+            the caller might hold. It runs under the L1 manager's lock, on
+            whichever thread frees the view, so it must never call back into
+            an L1 manager and may only submit the peer unlock, never wait for
+            it.
     """
 
     def __init__(
@@ -59,10 +61,27 @@ class BorrowedTensorMemoryObj(TensorMemoryObj):
         self._lease_is_valid = lease_is_valid
         self._on_release = on_release
 
+    def same_bytes(self, other: "BorrowedTensorMemoryObj") -> bool:
+        """Return whether ``other`` is a view of the same bytes as this one.
+
+        Args:
+            other: A view of the same key from a later lookup.
+
+        Returns:
+            True when both views alias one buffer of one size. A lender whose
+            views land in local buffers overrides this to compare the peer
+            address instead.
+        """
+        return (
+            self.raw_data.data_ptr() == other.raw_data.data_ptr()
+            and self.get_size() == other.get_size()
+        )
+
     def is_valid(self) -> bool:
         """Return whether the view is unreleased and its lease still holds."""
         return super().is_valid() and self._lease_is_valid()
 
     def release(self) -> None:
-        """End the lease; repeated calls are no-ops."""
+        """Invalidate the view and end the lease; repeated calls are no-ops."""
+        self.invalidate()
         self._on_release()

@@ -431,6 +431,11 @@ class LendingPeerL2AdapterBase(PeerL2AdapterBase):
     """
 
     def __init__(self, config: PeerL2AdapterConfigBase) -> None:
+        """Set up the peer control plane with no shadow L1 bound yet.
+
+        Args:
+            config: Peer RPC endpoint and lookup deadline.
+        """
         self._shadow_l1: "ShadowL1Manager | None" = None
         super().__init__(config)
 
@@ -479,7 +484,11 @@ class LendingPeerL2AdapterBase(PeerL2AdapterBase):
 
     @abstractmethod
     def get_active_borrow_count(self) -> int:
-        """Return live borrowed views, which must drain before removal."""
+        """Return live borrowed views, which must drain before removal.
+
+        Called on the prefetch loop thread while views are released on reader
+        threads through ``on_release``, so the count must be thread-safe.
+        """
 
 
 class P2PL2Adapter(PeerL2AdapterBase):

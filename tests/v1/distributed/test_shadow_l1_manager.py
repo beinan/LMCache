@@ -55,9 +55,9 @@ class Lease:
         self.releases += 1
 
 
-def _view(lease: Lease) -> BorrowedTensorMemoryObj:
+def _view(lease: Lease, data: torch.Tensor | None = None) -> BorrowedTensorMemoryObj:
     return BorrowedTensorMemoryObj(
-        torch.full((PAGE,), 7, dtype=torch.uint8),
+        torch.full((PAGE,), 7, dtype=torch.uint8) if data is None else data,
         MemoryObjMetadata(
             shape=torch.Size([PAGE]),
             dtype=torch.uint8,
@@ -144,11 +144,31 @@ def test_resident_view_adopts_the_fresh_lease(shadow: ShadowL1Manager) -> None:
     first = _view(first_lease)
     assert shadow.admit({KEY: first})[KEY] == (L1Error.SUCCESS, first)
     first_lease.valid = False  # the first reservation ran out meanwhile
-    assert shadow.admit({KEY: _view(second_lease)})[KEY] == (L1Error.SUCCESS, first)
+    same_bytes = _view(second_lease, data=first.raw_data)
+    assert shadow.admit({KEY: same_bytes})[KEY] == (L1Error.SUCCESS, first)
     assert (first_lease.releases, second_lease.releases) == (1, 0)
+    assert first.is_valid() and not same_bytes.is_valid()
     assert shadow.unsafe_read([KEY])[KEY] == (L1Error.SUCCESS, first)
     shadow.finish_read([KEY], read_locks=2)
     assert second_lease.releases == 1
+
+
+def test_a_view_of_other_bytes_is_a_miss_while_the_key_is_held(
+    shadow: ShadowL1Manager,
+) -> None:
+    """The peer moved the key since the holders' lease: the held view keeps
+    its bytes and lease, the fresh view is released, the request misses."""
+    held_lease, fresh_lease = Lease(), Lease()
+    held = _view(held_lease)
+    assert shadow.admit({KEY: held})[KEY] == (L1Error.SUCCESS, held)
+    assert shadow.admit({KEY: _view(fresh_lease)})[KEY] == (
+        L1Error.KEY_NOT_READABLE,
+        None,
+    )
+    assert (held_lease.releases, fresh_lease.releases) == (0, 1)
+    assert shadow.unsafe_read([KEY])[KEY] == (L1Error.SUCCESS, held)
+    assert shadow.finish_read([KEY])[KEY] == L1Error.SUCCESS
+    assert held_lease.releases == 1
 
 
 def test_expired_view_is_not_admitted(shadow: ShadowL1Manager) -> None:
@@ -224,6 +244,9 @@ def test_admit_sweeps_a_view_whose_read_ttl_lapsed(
     shadow_1s.admit({other: _view(Lease())})
     assert lease.releases == 1
     assert shadow_1s.unsafe_read([KEY])[KEY][0] == L1Error.KEY_NOT_EXIST
+    time.sleep(1.2)
+    shadow_1s.sweep_lapsed()  # the same sweep, without an admission
+    assert shadow_1s.unsafe_read([other])[other][0] == L1Error.KEY_NOT_EXIST
 
 
 def test_admit_replaces_a_stale_unheld_view(shadow_1s: ShadowL1Manager) -> None:

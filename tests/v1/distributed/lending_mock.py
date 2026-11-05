@@ -5,6 +5,7 @@ a REMOTE-wanting config whose adapter cannot lend (``nonlending_mock``)."""
 # Standard
 from typing import Optional
 from unittest.mock import MagicMock, patch
+import threading
 
 # First Party
 from lmcache.lmcache_native import Bitmap
@@ -125,6 +126,7 @@ class LendingMockL2Adapter(LendingPeerL2AdapterBase):
         # Reservations a lookup took at the owner and no view consumed yet.
         self._reserved: dict[ObjectKey, int] = {}
         self._live_views = 0
+        self._views_lock = threading.Lock()
         self.lookup_count = 0
         # While set, lookup results are withheld so several requests can have
         # lookups of the same key outstanding at once.
@@ -203,7 +205,8 @@ class LendingMockL2Adapter(LendingPeerL2AdapterBase):
             self._reserved[key] -= 1
             stored = self._owner.objects[key]
             ended: list[bool] = []
-            self._live_views += 1
+            with self._views_lock:
+                self._live_views += 1
 
             def lease_is_valid(ended: list[bool] = ended) -> bool:
                 return not ended
@@ -211,7 +214,8 @@ class LendingMockL2Adapter(LendingPeerL2AdapterBase):
             def end_lease(key: ObjectKey = key, ended: list[bool] = ended) -> None:
                 if not ended:
                     ended.append(True)
-                    self._live_views -= 1
+                    with self._views_lock:
+                        self._live_views -= 1
                     PeerL2AdapterBase.submit_unlock(self, [key])
 
             views[key] = BorrowedTensorMemoryObj(
@@ -223,7 +227,8 @@ class LendingMockL2Adapter(LendingPeerL2AdapterBase):
         return views
 
     def get_active_borrow_count(self) -> int:
-        return self._live_views
+        with self._views_lock:
+            return self._live_views
 
     # -- the rest of the peer contract --------------------------------------
 

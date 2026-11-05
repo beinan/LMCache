@@ -121,13 +121,16 @@ lender ── take_borrowed_objects ──► views ── admit ──► shado
   adapter closes it with itself. Serde on a lender, or a lender/`REMOTE`
   mismatch in either direction, is refused before anything is registered.
 - **Nothing is written, stored or evicted here.** The peer owns the bytes.
-  Store and eviction controllers, and prefetch admission, apply to owned L1s.
+  Store and eviction controllers, prefetch admission and L1 residency events
+  apply to owned L1s.
 - **The lookup is the renewal.** `admit` read-locks each view for one request.
-  A key already resident keeps its view, which adopts the fresh lease; the
-  older reservation goes back.
+  A key already resident keeps its view, which adopts the fresh lease when
+  both are views of the same bytes; the older reservation goes back. A fresh
+  view of other bytes is released and the key is a miss for that request.
 - **A read must finish within the owner's TTL.** An ended lease refuses new
   readers; a holder keeps its view until `finish_read`. An entry whose
-  readers' TTL lapsed is swept at the next `admit`.
+  readers' TTL lapsed is swept at the next `admit`, and while its lender
+  drains (`sweep_lapsed`).
 - **Only `LOCK` prefetches borrow.** A warm request keeps no read lock, and a
   view lives only while read-locked.
 - **Status.** Tags are `(segment, REMOTE)`, so P2P never re-exports a view.

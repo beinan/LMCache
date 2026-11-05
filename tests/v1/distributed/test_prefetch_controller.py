@@ -12,6 +12,7 @@ the full integration without mocking internals.
 
 # Standard
 from collections.abc import Sequence
+from dataclasses import replace
 from threading import Event
 from unittest.mock import patch
 import time
@@ -1989,13 +1990,14 @@ class TestShutdown:
 
 
 def make_lender(
-    l1_manager: DramL1Manager, adapter_id: int = 0
+    l1_manager: DramL1Manager, adapter_id: int = 0, read_ttl_seconds: int | None = None
 ) -> tuple[ShadowL1Manager, LendingMockL2Adapter]:
     """A lending adapter bound to the shadow L1 it brings, as StorageManager
     makes them; the adapter closes the shadow with itself."""
-    shadow = ShadowL1Manager.for_lender(
-        adapter_id, MemorySegment.DRAM, l1_manager.config
-    )
+    config = l1_manager.config
+    if read_ttl_seconds is not None:
+        config = replace(config, read_ttl_seconds=read_ttl_seconds)
+    shadow = ShadowL1Manager.for_lender(adapter_id, MemorySegment.DRAM, config)
     adapter = LendingMockL2Adapter(LendingMockL2AdapterConfig())
     adapter.bind_shadow_l1(shadow)
     return shadow, adapter
@@ -2078,6 +2080,34 @@ class TestBorrowing:
                 ctrl, ctrl.submit_prefetch_request(single_row_spec(keys))
             )
             assert row_bits(result) == []
+        finally:
+            ctrl.stop()
+            adapter.close()
+
+    def test_lender_removal_sweeps_a_lapsed_reader(self, l1_manager):
+        """A reader that never finishes stops holding its view once its read
+        TTL lapses; the drain sweeps that view, so removal completes instead
+        of waiting forever on the lender's borrow count."""
+        shadow, adapter = make_lender(l1_manager, adapter_id=1, read_ttl_seconds=1)
+        key = make_object_key(0)
+        store_keys_in_l2(adapter, [key], make_layout())
+        ctrl = make_controller(l1_manager, [])
+        ctrl.start()
+        try:
+            ctrl.add_adapter(
+                1,
+                adapter,
+                L2AdapterDescriptor(index=1, config=LendingMockL2AdapterConfig()),
+            )
+            result = wait_for_result(
+                ctrl, ctrl.submit_prefetch_request(single_row_spec([key]))
+            )
+            assert row_bits(result) == [0]
+            assert adapter.get_active_borrow_count() == 1
+            done = ctrl.request_remove_adapter(1)  # nobody calls finish_read
+            assert done.wait(timeout=10.0)
+            assert adapter.get_active_borrow_count() == 0
+            assert_l2_unlocked(adapter)
         finally:
             ctrl.stop()
             adapter.close()

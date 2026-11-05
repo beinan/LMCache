@@ -49,6 +49,7 @@ from lmcache.v1.distributed.l2_adapters.base import L2AdapterInterface, L2TaskId
 from lmcache.v1.distributed.l2_adapters.p2p_l2_adapter import (
     LendingPeerL2AdapterBase,
 )
+from lmcache.v1.distributed.memory_manager import BorrowedTensorMemoryObj
 from lmcache.v1.distributed.storage_controller import StorageControllerInterface
 from lmcache.v1.distributed.storage_controllers.adapter_lifecycle import (
     AddAdapterOp,
@@ -1058,12 +1059,14 @@ class PrefetchController(StorageControllerInterface):
             when the adapter's load result is admitted. A lender stays
             until every view it lent is released.
         """
-        adapter = self._l2_adapters.get(adapter_id)
-        if (
-            isinstance(adapter, LendingPeerL2AdapterBase)
-            and adapter.get_active_borrow_count()
-        ):
-            return True
+        shadow = self._shadow_l1s.get(adapter_id)
+        if shadow is not None:
+            # A reader whose TTL lapsed never finishes; its view is swept here
+            # since no admission reaches a draining lender's shadow.
+            shadow.sweep_lapsed()
+            lender = cast(LendingPeerL2AdapterBase, self._l2_adapters[adapter_id])
+            if lender.get_active_borrow_count():
+                return True
         for request in self._in_flight_requests.values():
             if (
                 adapter_id in request.inflight_lookup_tasks
@@ -1581,10 +1584,12 @@ class PrefetchController(StorageControllerInterface):
         """Register a lender's shadow L1 as an L1 and as the lender's affinity."""
         shadow = _lender_shadow(adapter_id, adapter)
         l1_id = shadow.l1_manager_id
-        self._l1_managers[l1_id] = shadow
-        self._l1_manager_descriptors[l1_id] = L1ManagerDescriptor(
-            index=l1_id, config=shadow.config
-        )
+        # Replaced, not mutated: add_adapter reads these on the caller's thread.
+        self._l1_managers = {**self._l1_managers, l1_id: shadow}
+        self._l1_manager_descriptors = {
+            **self._l1_manager_descriptors,
+            l1_id: L1ManagerDescriptor(index=l1_id, config=shadow.config),
+        }
         self._shadow_l1s[adapter_id] = shadow
         self._l2_affinity[adapter_id] = l1_id
 
@@ -1592,8 +1597,13 @@ class PrefetchController(StorageControllerInterface):
         """Forget a removed lender's shadow L1, if it had one."""
         shadow = self._shadow_l1s.pop(adapter_id, None)
         if shadow is not None:
-            del self._l1_managers[shadow.l1_manager_id]
-            del self._l1_manager_descriptors[shadow.l1_manager_id]
+            l1_id = shadow.l1_manager_id
+            self._l1_managers = {
+                k: v for k, v in self._l1_managers.items() if k != l1_id
+            }
+            self._l1_manager_descriptors = {
+                k: v for k, v in self._l1_manager_descriptors.items() if k != l1_id
+            }
 
     def _admit_borrowed_views(self, request: InFlightPrefetchRequest) -> None:
         """Move each lender's planned keys into its shadow L1 as borrowed views.
@@ -1614,15 +1624,20 @@ class PrefetchController(StorageControllerInterface):
                 continue
             lender = cast(LendingPeerL2AdapterBase, self._l2_adapters[adapter_idx])
             keys = _gather_keys(request.key_groups, cells)
-            views = lender.take_borrowed_objects(keys, layouts)
+            views: dict[ObjectKey, BorrowedTensorMemoryObj] = {}
             admitted = Bitmap(len(keys))
             try:
+                views = lender.take_borrowed_objects(keys, layouts)
                 # admit releases every view it does not keep; a lender never
                 # raises after creating a view, so admit sees all of them.
                 results = shadow.admit(views, read_locks=request.num_kv_readers)
                 for i, key in enumerate(keys):
                     if key in results and results[key][0] == L1Error.SUCCESS:
                         admitted.set(i)
+            except Exception:
+                for view in views.values():
+                    view.release()
+                raise
             finally:
                 lender.submit_unlock([key for key in keys if key not in views])
                 loaded = _scatter_bitmaps(cells, admitted)

@@ -30,7 +30,6 @@ from lmcache.v1.distributed.memory_manager import (
     ShadowL1MemoryManager,
 )
 from lmcache.v1.memory_management import MemoryObj
-from lmcache.v1.mp_observability.event import Event, EventType
 
 # The L1 medium a borrowed segment is reported as; other segments cannot be
 # borrowed.
@@ -132,10 +131,11 @@ class ShadowL1Manager(BaseL1Manager):
 
         The views' ownership passes to this manager: every view not kept
         resident is released before returning. A key already resident keeps
-        its view, which adopts the given view's lease; the given view is
-        released under the older lease, returning the older reservation.
-        Entries no reader holds any more (their readers' TTL lapsed) are
-        swept first.
+        its view, which adopts the given view's lease when both are views of
+        the same bytes; the given view is released under the older lease,
+        returning the older reservation. Entries no reader holds any more
+        (their readers' TTL lapsed) are swept first. No L1 event is
+        published: borrowed views are the peer's residency, not this node's.
 
         Args:
             objects: Borrowed view per key.
@@ -143,26 +143,19 @@ class ShadowL1Manager(BaseL1Manager):
 
         Returns:
             Per key: ``(SUCCESS, obj)`` with the resident object now
-            read-locked, or ``(KEY_IN_WRONG_STATE, None)`` when the given
-            view's lease ended before admission.
+            read-locked; ``(KEY_IN_WRONG_STATE, None)`` when the given view's
+            lease ended before admission; ``(KEY_NOT_READABLE, None)`` when a
+            resident view of other bytes is held, so the key is a miss for
+            this request.
 
         Raises:
             ValueError: If ``read_locks`` is out of range.
         """
         total = validate_read_locks(read_locks)
         ret: dict[ObjectKey, L1OperationResult] = {}
-        admitted_keys: list[ObjectKey] = []
-        admitted_meta: list[L1ObjectMeta] = []
         resident_keys: list[ObjectKey] = []
         discarded: list[MemoryObj] = []
-        # Temporary views leave at their last finish_read, so an unheld entry
-        # is one whose readers' TTL lapsed; its late finish_read is refused.
-        lapsed = [
-            key
-            for key, entry in self._objects.items()
-            if not entry.read_lock.is_locked()
-        ]
-        lapsed_objs = [self._objects.pop(key).memory_obj for key in lapsed]
+        self._sweep_lapsed_locked()
         for key, obj in objects.items():
             if not obj.is_valid():
                 discarded.append(obj)
@@ -170,9 +163,15 @@ class ShadowL1Manager(BaseL1Manager):
                 continue
             entry = self._objects.get(key)
             if entry is not None:
+                resident = cast(BorrowedTensorMemoryObj, entry.memory_obj)
+                if not resident.same_bytes(obj):
+                    # The peer moved the key since the holders' lease: they
+                    # keep their bytes, this request misses.
+                    discarded.append(obj)
+                    ret[key] = (L1Error.KEY_NOT_READABLE, None)
+                    continue
                 # Held by earlier readers: the fresh lease renews it, and the
                 # older reservation goes back with the discarded view.
-                resident = cast(BorrowedTensorMemoryObj, entry.memory_obj)
                 older = resident.lease
                 resident.replace_lease(*obj.lease)
                 obj.replace_lease(*older)
@@ -187,30 +186,25 @@ class ShadowL1Manager(BaseL1Manager):
                 )
                 obj.set_l1_manager(self.l1_manager_id)
                 self._objects[key] = entry
-                admitted_keys.append(key)
-                admitted_meta.append(self._object_meta(obj))
             for _ in range(total):
                 entry.read_lock.lock()
             ret[key] = (L1Error.SUCCESS, entry.memory_obj)
 
-        if lapsed:
-            self._free_and_report_deleted(lapsed, lapsed_objs)
         self._memory_manager.free(discarded)
         if resident_keys:
             self._report_read_reserved(resident_keys)
-        for listener in self._registered_listeners:
-            listener.on_l1_keys_finish_write_and_reserve_read(admitted_keys)
-        self._event_bus.publish(
-            Event(
-                event_type=EventType.L1_WRITE_FINISHED_AND_READ_RESERVED,
-                metadata={
-                    "l1_tag": self._config.tag,
-                    "keys": admitted_keys,
-                    "meta": admitted_meta,
-                },
-            )
-        )
         return ret
+
+    @l1_mgr_synchronized
+    def sweep_lapsed(self) -> None:
+        """Release every view no reader holds any more.
+
+        A temporary view leaves at its last ``finish_read``, so an unheld
+        entry is one whose readers' TTL lapsed; its late ``finish_read`` is
+        refused. ``admit`` sweeps too; a draining lender calls this so its
+        borrow count can reach zero without a new admission.
+        """
+        self._sweep_lapsed_locked()
 
     @l1_mgr_synchronized
     def reserve_read(
@@ -252,14 +246,26 @@ class ShadowL1Manager(BaseL1Manager):
         """Release every view, read-locked or not; idempotent.
 
         Call after stopping new controller and GPU submissions; outstanding
-        work on every device is synchronized first so no copy reads a
-        released view.
+        work on every device a view lives on is synchronized first so no
+        copy reads a released view.
         """
-        if torch_dev.is_available():
-            for device in range(torch_dev.device_count()):
-                torch_dev.synchronize(device)
+        with self._lock:
+            devices = {
+                entry.memory_obj.raw_data.device for entry in self._objects.values()
+            }
+        for device in devices:
+            if device.type != "cpu":
+                torch_dev.synchronize(device.index)
         super().close()
 
     def _object_meta(self, memory_obj: MemoryObj) -> L1ObjectMeta:
         """Report borrowed views as holding no local bytes."""
         return L1ObjectMeta(size_bytes=0, backend=self.backend_type)
+
+    def _sweep_lapsed_locked(self) -> None:
+        lapsed = [
+            key
+            for key, entry in self._objects.items()
+            if not entry.read_lock.is_locked()
+        ]
+        self._memory_manager.free([self._objects.pop(key).memory_obj for key in lapsed])
