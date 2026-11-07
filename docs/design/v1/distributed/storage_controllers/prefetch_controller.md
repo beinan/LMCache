@@ -89,6 +89,21 @@ read locks are released instead of publishing a result. Disposal uses the
 actual L1 owner and each row's `num_kv_readers`; `NO_LOCK` results have no
 remaining reservation. No extra thread or future client request is needed.
 
+`fetching_policy="segmented_prefix"` retains the ordinary window-aware prefix
+plus complete columns after that prefix. For example, with two full-attention
+rows present at `[0, 2, 4, 5]` and `[0, 2, 4]`, the result retains `[0, 2, 4]`
+in both rows: the prefix is one chunk, and columns 2 and 4 are reusable tail
+chunks. Column 5 is incomplete and its locks are released. Planning and final
+completion both apply this rule, so an L2 load failure can shorten the prefix
+without losing complete chunks beyond it. Sliding-window rows retain exactly
+their ordinary window before the prefix boundary.
+
+Callers must account for the locks of every returned hit cell, including the
+tail; releasing only the contiguous prefix is insufficient. This storage policy
+does not enable the CacheBlend server flag by itself. That caller must separate
+prefix and tail ownership and avoid overlapping sparse destinations before
+using it. Recurrent-state consumers must continue to request `prefix`.
+
 ## Admission
 
 Pending requests start while L1 has room for their loads, not up to a fixed
@@ -163,8 +178,9 @@ afterwards.
    adapter's L2 locks are returned and its entries leave `l2_locked_keys` and
    `l1_reserved_keys`.
 7. **Finish** (`_finish_request`), once no load task is outstanding. Fold the
-   merged `l1_locked_keys` (`fold_unfold_grouped`, prefix fetching only; `full`
-   keeps every locked cell). Release every L1 lock outside the hit, or every L1
+   merged `l1_locked_keys`: `prefix` keeps the window-aware prefix,
+   `segmented_prefix` adds complete post-prefix columns, and `full` keeps only
+   complete columns. Release every L1 lock outside the hit, or every L1
    lock under `NO_LOCK`. Touch the hit keys. Publish the `PrefetchResult` with
    the L1/L2 split taken from `l2_loaded_cells`.
 
@@ -182,8 +198,8 @@ policy assigned to an L2 adapter, "hit" is the final folded prefix:
 | finish | L1 read lock if in hit, else released | L1 read lock if in hit, else released | - | - |
 
 Under `NO_LOCK` the finish row releases every L1 lock; loaded objects stay
-resident and evictable. Under `full` fetching there is no fold: every locked
-cell is a hit cell.
+resident and evictable. Under `full` fetching, only complete columns are hits;
+locks from incomplete columns are released.
 
 **Errors.** Any exception while advancing a request aborts it
 (`_abort_request`): the three maps are walked to return L2 locks, delete
@@ -209,7 +225,8 @@ L2 for a request the L1 hits alone serve.
 
 `"prefix"` fetching plans the longest prefix every row can serve under its
 window (`fold_unfold_grouped`). `"full"` fetching plans every found cell and
-refuses sliding-window rows (empty plan, error log).
+refuses sliding-window rows (empty plan, error log). `"segmented_prefix"` adds
+complete post-prefix columns to the ordinary window-aware prefix plan.
 
 Policies self-register with `register_prefetch_policy(name, cls)` and are
 selected with `--l2-prefetch-policy`.
