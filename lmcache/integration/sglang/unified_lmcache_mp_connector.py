@@ -166,6 +166,7 @@ class UnifiedLMCacheMPConnector:
                     slots_per_block=slots_per_block,
                     tensor_rows_per_block=tuple(tensor_rows_per_block),
                     recurrent_state=group.recurrent_state,
+                    rope_num_layers=group.rope_num_layers,
                 )
             )
 
@@ -212,6 +213,7 @@ class UnifiedLMCacheMPConnector:
                     slots_per_block=group.slots_per_block,
                     tensor_rows_per_block=(1,) * len(group.kv_tensors),
                     recurrent_state=group.recurrent_state,
+                    rope_num_layers=group.rope_num_layers,
                 )
             )
         kv_tensors = [tensor for group in wire_groups for tensor in group.kv_tensors]
@@ -379,6 +381,14 @@ class UnifiedLMCacheMPConnector:
                         "tokens_per_block": group.tokens_per_block,
                         "sw_size_tokens": group.sliding_window_size,
                         "recurrent_state": group.recurrent_state,
+                        "rope_num_layers": (
+                            None
+                            if group.rope_num_layers is None
+                            else sum(
+                                idx < tensor_offset + group.rope_num_layers
+                                for idx in indices
+                            )
+                        ),
                         # MLA latent KV is identical on every TP rank, so the
                         # server keeps one object per TP group of it; recurrent
                         # state is sharded and stays per rank.

@@ -214,6 +214,7 @@ class TestSGLangUnifiedKVAdapter(unittest.TestCase):
         self.assertIs(groups[1].kv_tensors[1], swa_v)
         self.assertEqual(groups[0].tensor_rows_per_block, (4, 4))
         self.assertEqual(groups[1].sliding_window_size, 8)
+        self.assertEqual([group.rope_num_layers for group in groups], [1, 1])
 
     def test_resolve_registered_groups_keeps_dsa_in_full_group(self) -> None:
         """A DSA indexer remains a sidecar in FULL's block-ID space."""
@@ -235,6 +236,7 @@ class TestSGLangUnifiedKVAdapter(unittest.TestCase):
         self.assertIs(groups[0].kv_tensors[0], full)
         self.assertIs(groups[0].kv_tensors[1], indexer)
         self.assertEqual(groups[0].tensor_rows_per_block, (4, 1))
+        self.assertIsNone(groups[0].rope_num_layers)
 
     def test_resolve_registered_groups_accepts_kimi_conv_slice_axis(self) -> None:
         """Kimi conv state uses one complete slot despite TP slice_axis=1."""
@@ -257,6 +259,7 @@ class TestSGLangUnifiedKVAdapter(unittest.TestCase):
         self.assertEqual(tuple(groups[1].kv_tensors[0].shape), (5, 1, 21))
         self.assertEqual(groups[1].kv_tensors[0].data_ptr(), conv.data_ptr())
         self.assertTrue(groups[1].recurrent_state)
+        self.assertEqual(groups[1].rope_num_layers, 0)
 
     def test_resolve_registered_groups_maps_unified_mamba_buffer(self) -> None:
         """Unified Mamba storage is exposed as a zero-copy slot tensor."""

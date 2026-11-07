@@ -80,7 +80,7 @@ class SGLangUnifiedKVAdapter:
         for component_type in self.tree_components:
             if component_type is ComponentType.FULL:
                 component_pool = getattr(kv_pool, "full_kv_pool", kv_pool)
-                tensors = self._resolve_pool_tensors(component_pool)
+                tensors, rope_num_layers = self._resolve_pool_tensors(component_pool)
                 tensor_rows_per_block = (self.page_size,) * len(tensors)
                 dsa_tensors = self._resolve_dsa_indexer_tensors(component_pool)
                 if dsa_tensors:
@@ -95,6 +95,7 @@ class SGLangUnifiedKVAdapter:
                         slots_per_block=self.page_size,
                         tensor_rows_per_block=tensor_rows_per_block,
                         recurrent_state=False,
+                        rope_num_layers=rope_num_layers,
                     )
                 )
             elif component_type is ComponentType.SWA:
@@ -104,12 +105,13 @@ class SGLangUnifiedKVAdapter:
                         f"SWA component requires an SWA KV sub-pool, got "
                         f"{type(kv_pool).__name__}"
                     )
-                tensors = self._resolve_pool_tensors(component_pool)
+                tensors, rope_num_layers = self._resolve_pool_tensors(component_pool)
                 groups.append(
                     SGLangKVComponentGroup(
                         name=component_type.name.lower(),
                         kv_tensors=tensors,
                         sliding_window_size=self.aligned_swa_window_size(),
+                        rope_num_layers=rope_num_layers,
                         tokens_per_block=self.page_size,
                         slots_per_block=self.page_size,
                         tensor_rows_per_block=(self.page_size,) * len(tensors),
@@ -130,6 +132,7 @@ class SGLangUnifiedKVAdapter:
                         tokens_per_block=checkpoint_grid,
                         slots_per_block=1,
                         recurrent_state=True,
+                        rope_num_layers=0,
                     )
                 )
             else:
@@ -190,7 +193,10 @@ class SGLangUnifiedKVAdapter:
                 raise AssertionError(f"Unexpected LMCache component {component_type}")
         return result
 
-    def _resolve_pool_tensors(self, kv_pool) -> tuple[torch.Tensor, ...]:
+    def _resolve_pool_tensors(
+        self, kv_pool: Any
+    ) -> tuple[tuple[torch.Tensor, ...], int | None]:
+        """Return pool tensors and the leading key count when roles are explicit."""
         kv_buffer = getattr(kv_pool, "kv_buffer", None)
         if kv_buffer is not None:
             if not kv_buffer:
@@ -202,7 +208,7 @@ class SGLangUnifiedKVAdapter:
             )
             if not tensors:
                 raise NotImplementedError("DSA pool has no locally owned KV buffers")
-            return tensors
+            return tensors, None
 
         k_buffer = getattr(kv_pool, "k_buffer", None)
         v_buffer = getattr(kv_pool, "v_buffer", None)
@@ -214,7 +220,7 @@ class SGLangUnifiedKVAdapter:
             raise NotImplementedError(
                 "LMCacheUnifiedRadixCache currently supports NHD MHA pools only"
             )
-        return tuple([*k_buffer, *v_buffer])
+        return tuple([*k_buffer, *v_buffer]), len(k_buffer)
 
     def _resolve_dsa_indexer_tensors(self, kv_pool) -> tuple[torch.Tensor, ...]:
         """Return page-native DSA indexers that share FULL block IDs."""

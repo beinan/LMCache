@@ -563,6 +563,7 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
                 ),
                 tokens_per_block=4,
                 slots_per_block=4,
+                rope_num_layers=1,
             ),
             SGLangKVComponentGroup(
                 "swa",
@@ -573,6 +574,7 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
                 sliding_window_size=8,
                 tokens_per_block=4,
                 slots_per_block=4,
+                rope_num_layers=1,
             ),
         )
 
@@ -583,6 +585,15 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
             [spec["layer_indices"] for spec in specs], [(0, 1), (2,), (3,)]
         )
         self.assertEqual([spec["sw_size_tokens"] for spec in specs], [-1, 8, 8])
+        self.assertEqual([spec["rope_num_layers"] for spec in specs], [1, 1, 0])
+
+    def test_component_group_rejects_invalid_rotary_counts(self) -> None:
+        """Invalid counts must not be silently clamped during physical bucketing."""
+        tensors = (torch.empty(4, 1, 8), torch.empty(4, 1, 8))
+        for count in (-1, 3):
+            with self.subTest(count=count):
+                with self.assertRaisesRegex(ValueError, "rope_num_layers"):
+                    SGLangKVComponentGroup("full", tensors, rope_num_layers=count)
 
     def test_group_info_specs_mark_mamba_as_recurrent_one_block_window(self):
         connector = object.__new__(UnifiedLMCacheMPConnector)
@@ -632,6 +643,7 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
         specs, _ = connector._build_engine_group_info_specs()
 
         self.assertEqual([spec["tp_replicas"] for spec in specs], [4, 1])
+        self.assertEqual([spec["rope_num_layers"] for spec in specs], [None, None])
 
     def test_group_info_specs_keep_dsa_sidecar_in_full_address_space(self):
         connector = object.__new__(UnifiedLMCacheMPConnector)

@@ -40,6 +40,15 @@ class SGLangKVComponentGroup:
     slots_per_block: int = 0
     tensor_rows_per_block: tuple[int, ...] = ()
     recurrent_state: bool = False
+    rope_num_layers: int | None = None
+    """Leading K tensors; None when the pool's rotary components are unknown."""
+
+    def __post_init__(self) -> None:
+        """Reject rotation counts outside this component group's tensor list."""
+        if self.rope_num_layers is not None and not (
+            0 <= self.rope_num_layers <= len(self.kv_tensors)
+        ):
+            raise ValueError("rope_num_layers must be within the component count")
 
 
 @dataclass
