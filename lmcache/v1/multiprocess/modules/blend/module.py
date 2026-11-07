@@ -281,7 +281,7 @@ class BlendModule(
         return [P[i] for i in perm] if perm else []
 
     def _release_unretrieved_locks(self, session: Session) -> None:
-        """Retire abandoned lookup jobs and release unconsumed reservations.
+        """Retire lookup jobs, unconsumed reservations, and coordinator matches.
 
         Pending prefetch results transfer cleanup ownership to the storage
         manager; no session callback waits for I/O. Session destruction is
@@ -296,6 +296,8 @@ class BlendModule(
         if job is not None:
             with job.lock:
                 self._discard_lookup_job(job)
+        if self._coordinator is not None:
+            self._coordinator.take_match(session.request_id)
         stash = session.extras.pop(self.UNRETRIEVED_KEYS_EXTRA, None)
         if not stash:
             return
