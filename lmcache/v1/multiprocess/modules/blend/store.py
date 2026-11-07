@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 
 # First Party
 from lmcache.logging import init_logger
+from lmcache.v1.distributed.api import get_request_tags
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 from lmcache.v1.multiprocess.native_completion import submit_callback_to_stream
@@ -34,10 +35,30 @@ logger = init_logger(__name__)
 #: Dispatcher kind for stream-ordered fingerprint enqueues.
 CB_FINGERPRINTS_KIND = "cb_fingerprints"
 
+FingerprintNamespace = tuple[str, int, str, tuple[tuple[str, str], ...]]
+
+
+def fingerprint_namespace(key: IPCCacheServerKey) -> FingerprintNamespace:
+    """Return the model, world size, salt and identity tags of a local lookup.
+
+    Args:
+        key: The storage request whose identity the matcher must preserve.
+
+    Returns:
+        An immutable matching domain; operational request settings are excluded.
+    """
+    return (
+        key.model_name,
+        key.world_size,
+        key.cache_salt,
+        tuple(get_request_tags(key.request_configs).items()),
+    )
+
+
 #: One fingerprint-registration job:
-#: (tokens_in_range, chunk_hashes, position_offset, request_id). Also the
+#: (tokens_in_range, chunk_hashes, position_offset, request_id, namespace). Also the
 #: msgspec decode type for the dispatcher payload.
-FpJob = tuple[list[int], list[bytes], int, str]
+FpJob = tuple[list[int], list[bytes], int, str, FingerprintNamespace]
 
 
 class StoreMixin:
@@ -52,7 +73,7 @@ class StoreMixin:
         _token_range_matcher: "BlendTokenRangeMatcher"
         _fingerprint_queue: "Queue[FpJob]"
         _fingerprint_stop: "threading.Event"
-        _pending_fp_hashes: Counter[bytes]
+        _pending_fp_hashes: Counter[tuple[FingerprintNamespace, bytes]]
         _pending_fp_lock: "threading.Lock"
         _prompt_store: Any
 
@@ -117,6 +138,7 @@ class StoreMixin:
                 return stored_mask[i] if i < len(stored_mask) else False
 
             jobs: list[FpJob] = []
+            namespace = fingerprint_namespace(key)
             chunk_size = self._ctx.chunk_size
             run_start: int | None = None
             for i in range(len(chunk_hashes) + 1):
@@ -132,6 +154,7 @@ class StoreMixin:
                         chunk_hashes[run_start:i],
                         key.start + run_start * chunk_size,
                         key.request_id,
+                        namespace,
                     )
                 )
                 run_start = None
@@ -139,8 +162,8 @@ class StoreMixin:
                 return result
 
             with self._pending_fp_lock:
-                for _, hashes, _, _ in jobs:
-                    self._pending_fp_hashes.update(hashes)
+                for _, hashes, _, _, namespace in jobs:
+                    self._pending_fp_hashes.update((namespace, h) for h in hashes)
             entry = self._transfer_module.get_and_touch_context_entry(instance_id)
             gpu_ctx = entry.cache_context if entry is not None else None
             for job in jobs:
@@ -183,16 +206,19 @@ class StoreMixin:
                 job = self._fingerprint_queue.get_nowait()
             except QueueEmpty:
                 break
-            tokens_in_range, chunk_hashes, position_offset, rid = job
+            tokens_in_range, chunk_hashes, position_offset, rid, namespace = job
             try:
                 n_new = self._token_range_matcher.on_new_token_hashes(
-                    tokens_in_range, chunk_hashes, position_offset=position_offset
+                    tokens_in_range,
+                    chunk_hashes,
+                    position_offset=position_offset,
+                    namespace=namespace,
                 )
                 self._emit_fingerprints_registered(rid, n_new)
             except Exception:
                 logger.exception("CB fingerprint registration failed (sync drain)")
             finally:
-                self._retire_fingerprint_job(chunk_hashes)
+                self._retire_fingerprint_job(namespace, chunk_hashes)
 
     def _emit_fingerprints_registered(self, rid: str, num_chunks: int) -> None:
         """Publish CB_FINGERPRINTS_REGISTERED for one drained registration job.
@@ -223,21 +249,27 @@ class StoreMixin:
                 job = self._fingerprint_queue.get(timeout=0.1)
             except QueueEmpty:
                 continue
-            tokens_in_range, chunk_hashes, position_offset, rid = job
+            tokens_in_range, chunk_hashes, position_offset, rid, namespace = job
             try:
                 n_new = self._token_range_matcher.on_new_token_hashes(
-                    tokens_in_range, chunk_hashes, position_offset=position_offset
+                    tokens_in_range,
+                    chunk_hashes,
+                    position_offset=position_offset,
+                    namespace=namespace,
                 )
                 self._emit_fingerprints_registered(rid, n_new)
             except Exception:
                 logger.exception("CB fingerprint registration failed (async)")
             finally:
-                self._retire_fingerprint_job(chunk_hashes)
+                self._retire_fingerprint_job(namespace, chunk_hashes)
 
-    def _retire_fingerprint_job(self, chunk_hashes: list[bytes]) -> None:
+    def _retire_fingerprint_job(
+        self, namespace: FingerprintNamespace, chunk_hashes: list[bytes]
+    ) -> None:
         """Release this job's protection without retiring concurrent re-stores."""
         with self._pending_fp_lock:
-            self._pending_fp_hashes.subtract(chunk_hashes)
+            self._pending_fp_hashes.subtract((namespace, h) for h in chunk_hashes)
             for h in chunk_hashes:
-                if self._pending_fp_hashes[h] == 0:
-                    del self._pending_fp_hashes[h]
+                scoped_hash = (namespace, h)
+                if self._pending_fp_hashes[scoped_hash] == 0:
+                    del self._pending_fp_hashes[scoped_hash]

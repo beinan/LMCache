@@ -26,6 +26,12 @@ blend/
                          expansion
 ```
 
+Local fingerprints, pending registrations, and stale strikes are scoped by
+model, world size, cache salt, and canonical `lmcache.tag.*` identity tags.
+Foreign lookup misses do not add stale strikes to another domain. All
+namespaces share the matcher's bounded table; no per-namespace table is allocated.
+Storage object identity remains the final check before a match is retrieved.
+
 The pure modules have no server context, streams, or event bus — they are
 CPU-testable by import. All mutable state is created in
 `BlendModule.__init__`; mixin methods share it on `self`.

@@ -16,6 +16,9 @@ import inspect
 import threading
 import time
 
+# Third Party
+import msgspec
+
 # First Party
 from lmcache.v1.distributed.api import AttnWindowDesc
 from lmcache.v1.mp_coordinator.blend_client import PENDING
@@ -29,6 +32,7 @@ from lmcache.v1.multiprocess.modules.blend.module import BlendModule
 from lmcache.v1.multiprocess.modules.blend.read_set import (
     _classify_cb_read_groups,
 )
+from lmcache.v1.multiprocess.modules.blend.store import FpJob, fingerprint_namespace
 from lmcache.v1.multiprocess.token_codec import pack_token_ids
 
 _CHUNK = 256
@@ -96,7 +100,13 @@ class TestFingerprintsRegisteredEvent:
         eng._emit_fingerprints_registered = _bind(eng, "_emit_fingerprints_registered")
         # Job size says 3 chunks; the matcher only indexed 1 of them.
         eng._fingerprint_queue.put(
-            (list(range(3 * _CHUNK)), [b"h0", b"h1", b"h2"], 0, "req-sync")
+            (
+                list(range(3 * _CHUNK)),
+                [b"h0", b"h1", b"h2"],
+                0,
+                "req-sync",
+                ("m", 1, "", ()),
+            )
         )
 
         _bind(eng, "_drain_fingerprints_sync")()
@@ -115,7 +125,7 @@ class TestFingerprintsRegisteredEvent:
         eng._pending_fp_hashes = set()
         eng._token_range_matcher.on_new_token_hashes.return_value = 0
         eng._emit_fingerprints_registered = _bind(eng, "_emit_fingerprints_registered")
-        eng._fingerprint_queue.put(([1], [b"h0"], 0, "req-dup"))
+        eng._fingerprint_queue.put(([1], [b"h0"], 0, "req-dup", ("m", 1, "", ())))
 
         worker = threading.Thread(
             target=_bind(eng, "_drain_fingerprint_queue"), daemon=True
@@ -140,7 +150,7 @@ class TestFingerprintsRegisteredEvent:
         eng._fingerprint_queue = Queue()
         eng._token_range_matcher.on_new_token_hashes.side_effect = RuntimeError("boom")
         eng._emit_fingerprints_registered = _bind(eng, "_emit_fingerprints_registered")
-        eng._fingerprint_queue.put(([1], [b"h0"], 0, "req-fail"))
+        eng._fingerprint_queue.put(([1], [b"h0"], 0, "req-fail", ("m", 1, "", ())))
 
         _bind(eng, "_drain_fingerprints_sync")()
 
@@ -291,6 +301,10 @@ class TestFingerprintJobTuple:
         eng._fingerprint_queue = Queue()
         key = SimpleNamespace(
             request_id="req-store",
+            model_name="m",
+            world_size=1,
+            cache_salt="",
+            request_configs=None,
             worker_id=0,
             token_bytes=pack_token_ids(range(512)),
             start=0,
@@ -300,7 +314,9 @@ class TestFingerprintJobTuple:
         assert _bind(eng, "store")(key, 0, [[0, 1]], b"evt") == (b"handle", True)
 
         job = eng._fingerprint_queue.get_nowait()
-        assert len(job) == 4, "job tuple must carry the request id"
+        assert len(job) == 5, "job tuple must carry request id and namespace"
+        assert job[4] == fingerprint_namespace(key)
+        assert msgspec.msgpack.decode(msgspec.msgpack.encode(job), type=FpJob) == job
         assert job[3] == "req-store"
 
 

@@ -3,6 +3,7 @@
 
 # Standard
 from collections import Counter, OrderedDict
+from dataclasses import replace
 from queue import Queue
 from typing import Any
 import threading
@@ -37,8 +38,10 @@ from lmcache.v1.multiprocess.modules.blend.retrieve import (
 from lmcache.v1.multiprocess.modules.blend.rope import _CBRopeState
 from lmcache.v1.multiprocess.modules.blend.store import (
     CB_FINGERPRINTS_KIND,
+    FingerprintNamespace,
     FpJob,
     StoreMixin,
+    fingerprint_namespace,
 )
 from lmcache.v1.multiprocess.modules.lmcache_driven_transfer import (
     LMCacheDrivenTransferModule,
@@ -207,12 +210,12 @@ class BlendModule(
 
         # Number of unfinished registration jobs per hash; protects re-stores
         # until every job for the same chunk has finished.
-        self._pending_fp_hashes: Counter[bytes] = Counter()
+        self._pending_fp_hashes: Counter[tuple[FingerprintNamespace, bytes]] = Counter()
         self._pending_fp_lock = threading.Lock()
 
         # Lazy eviction strikes; evict only at threshold so async re-store
         # can refresh the bucket first.
-        self._stale_strike: dict[bytes, int] = {}
+        self._stale_strike: dict[tuple[FingerprintNamespace, bytes], int] = {}
         self._STALE_STRIKE_THRESHOLD = 2
 
     def _reset_token_range_matcher(self, chunk_size: int) -> None:
@@ -267,7 +270,10 @@ class BlendModule(
             ns = store.resolve(key.model_name, key.world_size, key.cache_salt)
             if ns is None:  # the salt must match; empty name / zero size = any
                 return []
-            hits = self._token_range_matcher.match_sub_sequence(P)
+            namespace = fingerprint_namespace(
+                replace(key, model_name=ns[0], world_size=ns[1], cache_salt=ns[2])
+            )
+            hits = self._token_range_matcher.match_sub_sequence(P, namespace=namespace)
             cands, base = store.candidates(
                 ns,
                 [h.hash for h in hits],

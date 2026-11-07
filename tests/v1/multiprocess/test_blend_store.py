@@ -8,6 +8,7 @@ callbacks. The synchronous lookup regression uses the real fingerprint matcher.
 """
 
 # Standard
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Literal
 from unittest.mock import MagicMock
@@ -27,8 +28,10 @@ from lmcache.v1.distributed.api import (
     DEFAULT_SHARD_REPLICATION_DESC,
     AttnWindowDesc,
     MemoryLayoutDesc,
+    ObjectKey,
     PrefetchHandle,
     PrefetchResult,
+    PrefetchTaskSpec,
 )
 from lmcache.v1.mp_coordinator.blend_client import PENDING  # noqa: F401
 from lmcache.v1.mp_coordinator.blend_client import BlendCoordinatorClient
@@ -43,6 +46,7 @@ from lmcache.v1.multiprocess.modules.blend.read_set import (
     _classify_cb_read_groups,
 )
 from lmcache.v1.multiprocess.modules.blend.rope import _CBRopeState
+from lmcache.v1.multiprocess.modules.blend.store import fingerprint_namespace
 from lmcache.v1.multiprocess.modules.lmcache_driven_transfer import (
     LMCacheDrivenTransferModule,
 )
@@ -63,16 +67,8 @@ from tests.v1.multiprocess.transport_test_utils import (
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("restore_pending", [False, True])
-def test_lookup_drained_fingerprints_can_be_evicted(
-    monkeypatch: pytest.MonkeyPatch,
-    restore_pending: bool,
-) -> None:
-    """Finished synchronous indexing must not protect missing KV indefinitely."""
-    # Hold the background worker so lookup deterministically owns the queued job.
-    monkeypatch.setattr(
-        "lmcache.v1.multiprocess.modules.blend.module.threading.Thread", MagicMock()
-    )
+def _local_blend_context() -> MagicMock:
+    """Use real token/session state with mocked layout and storage boundaries."""
     ctx = MagicMock()
     ctx.chunk_size = 4
     ctx.token_hasher = TokenHasher(chunk_size=4)
@@ -87,6 +83,20 @@ def test_lookup_drained_fingerprints_can_be_evicted(
     ctx.layout_desc_registry.find_shard_replication_desc.return_value = (
         DEFAULT_SHARD_REPLICATION_DESC
     )
+    return ctx
+
+
+@pytest.mark.parametrize("restore_pending", [False, True])
+def test_lookup_drained_fingerprints_can_be_evicted(
+    monkeypatch: pytest.MonkeyPatch,
+    restore_pending: bool,
+) -> None:
+    """Finished synchronous indexing must not protect missing KV indefinitely."""
+    # Hold the background worker so lookup deterministically owns the queued job.
+    monkeypatch.setattr(
+        "lmcache.v1.multiprocess.modules.blend.module.threading.Thread", MagicMock()
+    )
+    ctx = _local_blend_context()
     ctx.storage_manager.submit_prefetch_task.return_value = PrefetchHandle(
         prefetch_request_id=1,
         external_request_id="test",
@@ -135,6 +145,107 @@ def test_lookup_drained_fingerprints_can_be_evicted(
         blend.close()
 
 
+@pytest.mark.parametrize(
+    "foreign_field", ["model_name", "world_size", "cache_salt", "request_configs"]
+)
+def test_foreign_namespace_misses_preserve_owner_matches(
+    monkeypatch: pytest.MonkeyPatch, foreign_field: str
+) -> None:
+    monkeypatch.setattr(
+        "lmcache.v1.multiprocess.modules.blend.module.threading.Thread", MagicMock()
+    )
+    ctx = _local_blend_context()
+    stored_key = ObjectKey(
+        chunk_hash=ctx.token_hasher.compute_chunk_hashes([1, 2, 3, 4])[0],
+        model_name="model",
+        kv_rank=ObjectKey.ComputeKVRank(1, 0, 1, 0),
+        cache_salt="owner",
+        tags={"tenant": "owner", "region": "here"},
+    )
+    results: list[PrefetchResult] = []
+
+    def submit(spec: PrefetchTaskSpec, external_request_id: str) -> PrefetchHandle:
+        rows = []
+        for group in spec.key_groups:
+            row = Bitmap(len(group.keys))
+            for col, key in enumerate(group.keys):
+                if key == stored_key:
+                    row.set(col)
+            rows.append(row)
+        results.append(
+            PrefetchResult(
+                hit_cells=rows,
+                l1_hit_cells=rows,
+                l2_hit_cells=[Bitmap(len(g.keys)) for g in spec.key_groups],
+            )
+        )
+        return PrefetchHandle(len(results) - 1, external_request_id, 0, 0)
+
+    ctx.storage_manager.submit_prefetch_task.side_effect = submit
+    ctx.storage_manager.query_prefetch_status.side_effect = lambda handle: results[
+        handle.prefetch_request_id
+    ]
+    transfer = MagicMock()
+    transfer.store_with_chunk_mask.return_value = (b"done", True, [True])
+    transfer.get_and_touch_context_entry.return_value = None
+    blend = BlendModule(ctx, transfer)
+    source = IPCCacheServerKey.from_token_ids(
+        "model",
+        1,
+        0,
+        [1, 2, 3, 4],
+        request_id="store",
+        end=4,
+        cache_salt="owner",
+        request_configs={"lmcache.tag.tenant": "owner", "lmcache.tag.region": "here"},
+    )
+    owner = replace(
+        source,
+        worker_id=None,
+        token_bytes=pack_token_ids([99, 1, 2, 3, 4]),
+        request_configs={
+            "lmcache.tag.region": "here",
+            "lmcache.tag.tenant": "owner",
+            "cb.store": False,
+        },
+    )
+    foreign = {
+        "model_name": replace(owner, model_name="other-model"),
+        "world_size": replace(owner, world_size=2),
+        "cache_salt": replace(owner, cache_salt="foreign"),
+        "request_configs": replace(
+            owner,
+            request_configs={
+                "lmcache.tag.tenant": "foreign",
+                "lmcache.tag.region": "here",
+            },
+        ),
+    }[foreign_field]
+    try:
+        assert blend.store(source, 0, [[0]], b"ready") == (b"done", True)
+        coverage = []
+        sparse_submissions = []
+        for i, key in enumerate([owner, foreign, foreign, owner]):
+            ctx.storage_manager.submit_prefetch_task.reset_mock()
+            result = blend.cb_unified_lookup(replace(key, request_id=f"lookup-{i}"), 1)
+            assert result is not None
+            coverage.append(
+                sum(m.cur_ed - m.cur_st for m in result.non_prefix_segments)
+            )
+            sparse_submissions.append(
+                sum(
+                    call.args[0].fetching_policy == "full"
+                    for call in ctx.storage_manager.submit_prefetch_task.call_args_list
+                )
+            )
+        assert sparse_submissions == [1, 0, 0, 1]
+        assert coverage == [4, 0, 0, 4]
+        result = blend.cb_unified_lookup(replace(source, request_id="exact"), 1)
+        assert result is not None and result.prefix_coverage_tokens == 4
+    finally:
+        blend.close()
+
+
 def _make_engine_with_mocked_matcher():
     """Construct a real BlendModule with the matcher mocked so we can
     observe `on_new_token_hashes` calls without setting up storage."""
@@ -170,9 +281,9 @@ def test_fingerprint_queue_drains_in_order():
     worker.start()
     try:
         jobs = [
-            ([1, 2, 3], [b"h1"], 0, "req-a"),
-            ([4, 5, 6], [b"h2"], 3, "req-b"),
-            ([7, 8, 9], [b"h3"], 6, "req-c"),
+            ([1, 2, 3], [b"h1"], 0, "req-a", ("m", 1, "", ())),
+            ([4, 5, 6], [b"h2"], 3, "req-b", ("m", 1, "", ())),
+            ([7, 8, 9], [b"h3"], 6, "req-c", ("m", 1, "", ())),
         ]
         for j in jobs:
             eng._fingerprint_queue.put(j)
@@ -196,7 +307,7 @@ def test_fingerprint_queue_drains_in_order():
     assert calls[1].args[0] == [4, 5, 6]
     assert calls[2].args[0] == [7, 8, 9]
     # The position offset is preserved.
-    assert calls[1].kwargs == {"position_offset": 3}
+    assert calls[1].kwargs == {"position_offset": 3, "namespace": ("m", 1, "", ())}
 
 
 def test_fingerprint_worker_survives_kernel_exception():
@@ -215,8 +326,8 @@ def test_fingerprint_worker_survives_kernel_exception():
     worker = threading.Thread(target=eng._drain_fingerprint_queue, daemon=True)
     worker.start()
     try:
-        eng._fingerprint_queue.put(([1], [b"h1"], 0, "req-a"))
-        eng._fingerprint_queue.put(([2], [b"h2"], 1, "req-b"))
+        eng._fingerprint_queue.put(([1], [b"h1"], 0, "req-a", ("m", 1, "", ())))
+        eng._fingerprint_queue.put(([2], [b"h2"], 1, "req-b", ("m", 1, "", ())))
         deadline = time.monotonic() + 2.0
         while (
             eng._token_range_matcher.on_new_token_hashes.call_count < 2
@@ -741,7 +852,7 @@ def test_store_registers_fingerprints_only_for_committed_chunks():
         TokenHasher.hash_to_bytes(101),
         TokenHasher.hash_to_bytes(103),
     }
-    assert eng._pending_fp_hashes == expected
+    assert eng._pending_fp_hashes == {(fingerprint_namespace(key), h) for h in expected}
 
 
 def test_store_registers_nothing_when_no_chunk_committed():
