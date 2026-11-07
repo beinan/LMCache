@@ -64,13 +64,18 @@ covers, `request_id` (session tracking), and `worker_id` (TP rank).
   matches beyond the prefix, `cur_st` order, each
   `(old_st, old_ed, cur_st, cur_ed, hash)`) — already sparse-prefetched,
   so the retrieve set equals this set.
+- With segmented-prefix reuse enabled, `segmented_prefix_segments` contains
+  complete post-gap chunks from the request's own hash chain, at their original
+  positions. These exact matches take precedence over overlapping fingerprint
+  matches. Recurrent registrations retain prefix-only behavior.
 - Side effects: sparse read locks taken and stashed on the session for the
   retrieve.
 
 **`cb_retrieve_pre_computed(key, matches, gpu_block_ids, instance_id,
 event_ipc) → (event_ipc, scatter_ran)`**
 
-- In: `matches` — the lookup's `non_prefix_segments`, any order;
+- In: `matches` — the lookup's `non_prefix_segments` and
+  `segmented_prefix_segments`, any order;
   `gpu_block_ids` — one block table per engine group, indexed by
   `engine_group_id`, possibly partially allocated (vLLM calls once per
   block-alloc round); `event_ipc` — the forward's CUDA event handle.
@@ -133,8 +138,15 @@ The two legs trim opposite ways:
 | Result | leading-ones count via the window-aware fold — truncate at the first gap; `SEGMENTED_PREFIX` additionally retains fully-loaded post-gap chunks (off for recurrent registrations) | keep every chunk whose **entire (read-group × rank) key set** loaded; no contiguity |
 | Why | vLLM consumes the prefix as one `num_computed_tokens`; recurrent state needs unbroken history | chunks relocate independently; the forward recomputes the holes |
 
-A chunk missing **any** rank's or **any** read group's key is dropped whole
-and takes a stale strike (evicted from the matcher at the strike threshold);
+Before reporting a segmented tail, the sparse leg reacquires its complete
+blend read set, including auxiliary groups. The prefix leg keeps its tail
+reservations until this handoff completes, then releases them and retains
+ownership of only the contiguous prefix. A tail missing auxiliary data is
+omitted without a matcher strike; overlapping fingerprint matches remain
+eligible. Cancellation releases whichever legs still own reservations.
+
+A fingerprint chunk missing **any** rank's or **any** read group's key is dropped
+whole and takes a stale strike (evicted from the matcher at the strike threshold);
 the rest of the request proceeds. The found set's object keys are stashed in
 `Session.extras` for the retrieve; whatever no retrieve consumes is released
 by the session-destroy listener.

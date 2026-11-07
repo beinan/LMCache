@@ -2,6 +2,7 @@
 """Blend unified lookup FSM: prefix, local-match, coordinator, and sparse legs."""
 
 # Standard
+from bisect import bisect_right
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 import threading
@@ -78,6 +79,7 @@ class _CBUnifiedJob:
     prefix_num_chunks: int = 0  # chunks in the submitted prefix key list
     prefix_chunks: int | None = None  # stashed when the prefix poll completes
     retained_chunks: list[int] | None = None  # SEGMENTED_PREFIX: full gapped set
+    segmented_matches: list[CBMatchResult] = field(default_factory=list)
     sparse_started: bool = False  # prefix done -> sparse leg submitted/skipped
     handle: PrefetchHandle | None = None  # sparse handle, None if no sparse leg
     non_prefix: list[CBMatchResult] | None = None
@@ -235,14 +237,18 @@ class LookupMixin:
         l1_owners: dict[ObjectKey, int] | None = None,
         *,
         session: Session,
+        unindexed_hashes: frozenset[bytes] = frozenset(),
     ) -> tuple[list[CBMatchResult], int]:
         """Classify each prefetched chunk: found (every key loaded),
         skipped (exists per ``avail_rows`` but not fully staged: no strike,
         loaded keys released now), or stale (absent: eviction strike).
         Without ``avail_rows``, any-key-loaded approximates existence.
-        Eviction events count only fingerprints removed at the strike threshold.
+        Exact-prefix candidates in ``unindexed_hashes`` do not take matcher
+        strikes if their auxiliary groups are unavailable. Eviction events
+        count only fingerprints removed at the strike threshold.
 
-        Returns the found subset in cur_st order and the number of absent chunks."""
+        Returns the found subset in cur_st order and the number of absent
+        fingerprint chunks (excluding exact-prefix candidates)."""
         found_cb_match_result: list[CBMatchResult] = []
         stale_hashes: list[bytes] = []
         partial_release_keys: list = []
@@ -250,7 +256,8 @@ class LookupMixin:
         for r in matches:
             col = hash_to_col.get(r.hash)
             if col is None:
-                stale_hashes.append(r.hash)
+                if r.hash not in unindexed_hashes:
+                    stale_hashes.append(r.hash)
                 continue
             landed = [row.test(col) for row in found_rows]
             if all(landed):
@@ -268,7 +275,8 @@ class LookupMixin:
                         k for k, hit in zip(keys, landed, strict=False) if hit
                     )
             else:
-                stale_hashes.append(r.hash)
+                if r.hash not in unindexed_hashes:
+                    stale_hashes.append(r.hash)
         if partial_release_keys:
             finish_lookup_read(self._ctx, key, partial_release_keys, l1_owners)
         # Dropped chunks silently shrink coverage — log for diagnosis.
@@ -415,7 +423,11 @@ class LookupMixin:
                     key.model_name, key.world_size
                 ),
             ),
-            fetching_policy="prefix",
+            fetching_policy=(
+                "segmented_prefix"
+                if self._segmented_prefix and not read.recurrent_gids
+                else "prefix"
+            ),
         )
         row_windows = tuple(row.sliding_window_size for row in spec.key_groups)
         session.set_tokens(key.token_bytes)
@@ -500,8 +512,11 @@ class LookupMixin:
         Returns:
             ``None`` while either leg is still loading (the caller re-issues
             to poll); on completion, the prefix coverage in tokens plus the
-            found non-prefix segments. A result with nothing to retrieve also
-            ends the request here (no retrieve will follow).
+            found non-prefix segments. With segmented-prefix reuse enabled,
+            complete post-gap chunks from this prompt's hash chain are returned
+            separately in ``segmented_prefix_segments`` and take precedence over
+            overlapping fingerprint matches. A result with nothing to retrieve
+            also ends the request here (no retrieve will follow).
 
         Raises:
             RuntimeError: The lookup retired while this poll waited for its lock.
@@ -604,6 +619,28 @@ class LookupMixin:
             job.prefix_chunks, prefix_retained = res
             if segmented:
                 job.retained_chunks = prefix_retained
+
+            # Segmented tail: post-gap chunks the SEGMENTED_PREFIX leg kept
+            # resident, delivered at their original positions (old_st == cur_st)
+            # so the connector tags them ``prefix`` (pure load, no recompute).
+            job.segmented_matches = []
+            if segmented and job.retained_chunks:
+                chunk_hashes = self._ctx.token_hasher.compute_packed_chunk_hashes(
+                    key.token_bytes
+                )
+                for i in job.retained_chunks:
+                    if i < job.prefix_chunks or i >= len(chunk_hashes):
+                        continue  # leading run (already prefix) / sub-chunk tail
+                    st = i * chunk_size
+                    job.segmented_matches.append(
+                        CBMatchResult(
+                            old_st=st,
+                            old_ed=st + chunk_size,
+                            cur_st=st,
+                            cur_ed=st + chunk_size,
+                            hash=chunk_hashes[i],
+                        )
+                    )
         assert job.prefix_chunks is not None
         prefix_chunks: int = job.prefix_chunks
 
@@ -618,18 +655,10 @@ class LookupMixin:
                     return None  # coordinator still in flight (bounded by deadline)
             else:
                 candidates = job.matches
-            # Under SEGMENTED_PREFIX, a same-position match the prefix leg
-            # already retained rides the segmented tail -- drop it so it is
-            # not scattered twice. A same-position match the tail does NOT
-            # cover is a genuine cross-context hit: keep it as non-prefix
-            # (it still needs CHECK). Shifted matches are always kept.
-            if segmented:
-                retained = set(job.retained_chunks or [])
-                candidates = [
-                    c
-                    for c in candidates
-                    if c.old_st != c.cur_st or (c.cur_st // chunk_size) not in retained
-                ]
+            exact_hashes = {match.hash for match in job.segmented_matches}
+            candidates = job.segmented_matches + [
+                match for match in candidates if match.hash not in exact_hashes
+            ]
             # Prefix-filter only; the overlap dedup runs AFTER the prefetch,
             # so the winner is chosen among chunks that can actually be fetched.
             job.non_prefix = [c for c in candidates if c.cur_st >= prefix_tokens]
@@ -697,47 +726,52 @@ class LookupMixin:
                 job.avail_rows,
                 l1_owners=job.l1_owners,
                 session=job.session,
+                unindexed_hashes=frozenset(m.hash for m in job.segmented_matches),
             )
-            # Overlap dedup over the retrievable candidates; dropped
-            # candidates' keys are released by the retrieve's orphan sweep.
-            found = self._non_overlapping_after_prefix(
-                fetched, prefix_chunks * chunk_size
-            )
-            if len(found) != len(fetched):
-                logger.debug(
-                    "CB kept %d of %d retrievable matches after overlap dedup (req=%s)",
-                    len(found),
-                    len(fetched),
-                    rid,
-                )
         else:
-            found = []
+            fetched = []
             stale_chunks = 0
+
+        exact_hashes = {match.hash for match in job.segmented_matches}
+        segmented_tail = sorted(
+            (match for match in fetched if match.hash in exact_hashes),
+            key=lambda match: match.cur_st,
+        )
+        tail_ends = [match.cur_ed for match in segmented_tail]
+        candidates = []
+        for match in fetched:
+            if match.hash in exact_hashes:
+                continue
+            next_tail = bisect_right(tail_ends, match.cur_st)
+            if (
+                next_tail == len(segmented_tail)
+                or match.cur_ed <= segmented_tail[next_tail].cur_st
+            ):
+                candidates.append(match)
+        found = (
+            self._non_overlapping_after_prefix(candidates, prefix_chunks * chunk_size)
+            if candidates
+            else []
+        )
+
+        if job.segmented_matches:
+            # Keep the prefix leg's reservation until the sparse leg has
+            # acquired every blend read group (including optional auxiliaries).
+            owners = job.session.get_prefetch_owners()
+            tail_keys = [key for key in owners if key.chunk_hash in exact_hashes]
+            finish_lookup_read(self._ctx, key, tail_keys, owners)
+            job.session.record_prefetch_result(
+                prefix_chunks,
+                job.prefix_lock_gids,
+                {
+                    key: owner
+                    for key, owner in owners.items()
+                    if key.chunk_hash not in exact_hashes
+                },
+            )
 
         prefix_tokens = prefix_chunks * chunk_size
         num_tokens = job.num_tokens
-
-        # Segmented tail: post-gap chunks the SEGMENTED_PREFIX leg kept
-        # resident, delivered at their original positions (old_st == cur_st)
-        # so the connector tags them ``prefix`` (pure load, no recompute).
-        segmented_tail: list[CBMatchResult] = []
-        if segmented and job.retained_chunks:
-            chunk_hashes = self._ctx.token_hasher.compute_packed_chunk_hashes(
-                key.token_bytes
-            )
-            for i in job.retained_chunks:
-                if i < prefix_chunks or i >= len(chunk_hashes):
-                    continue  # leading run (already prefix) / sub-chunk tail
-                st = i * chunk_size
-                segmented_tail.append(
-                    CBMatchResult(
-                        old_st=st,
-                        old_ed=st + chunk_size,
-                        cur_st=st,
-                        cur_ed=st + chunk_size,
-                        hash=chunk_hashes[i],
-                    )
-                )
 
         seg_tail_tokens = _unique_token_coverage(segmented_tail)
         non_prefix_hit_tokens = _unique_token_coverage(found)
