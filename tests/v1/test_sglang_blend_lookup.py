@@ -4,17 +4,22 @@
 # Standard
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
+import threading
 import unittest
 
 # Third Party
 import torch
 
 # First Party
-from lmcache.integration.sglang.lmcache_mp_metadata import SGLangKVComponentGroup
+from lmcache.integration.sglang.lmcache_mp_metadata import (
+    LMCacheLoadOperation,
+    SGLangKVComponentGroup,
+)
 from lmcache.integration.sglang.unified_lmcache_mp_connector import (
     UnifiedLMCacheMPConnector,
 )
 from lmcache.v1.multiprocess.custom_types import CBMatchResult, CBUnifiedLookupResult
+from lmcache.v1.multiprocess.futures import MessagingFuture
 
 
 class TestSGLangBlendLookup(unittest.TestCase):
@@ -33,8 +38,14 @@ class TestSGLangBlendLookup(unittest.TestCase):
         self.client = Mock()
         self.client.get_chunk_size.return_value.result.return_value = 8
         self.client.cb_protocol_handshake.return_value.result.return_value = (2, True)
-        self.future = self.client.cb_unified_lookup.return_value
-        self.future.query.return_value = True
+        self.future: MessagingFuture[CBUnifiedLookupResult | None] = MessagingFuture()
+        self.client.cb_unified_lookup.return_value = self.future
+        self.release: MessagingFuture[None] = MessagingFuture()
+        self.release.set_result(None)
+        self.client.free_lookup_locks.return_value = self.release
+        self.ended: MessagingFuture[None] = MessagingFuture()
+        self.ended.set_result(None)
+        self.client.end_session.return_value = self.ended
         with (
             patch.dict("sys.modules", {module_name: adapter_module}),
             patch(
@@ -64,7 +75,10 @@ class TestSGLangBlendLookup(unittest.TestCase):
 
     def test_sparse_only_hit_survives_pending_polls_and_finishes_once(self) -> None:
         result = CBUnifiedLookupResult(0, [CBMatchResult(0, 8, 8, 16, b"hash")])
-        self.future.result.side_effect = [None, result]
+        self.future.set_result(None)
+        complete: MessagingFuture[CBUnifiedLookupResult | None] = MessagingFuture()
+        complete.set_result(result)
+        self.client.cb_unified_lookup.side_effect = [self.future, complete]
         operation = self.connector.submit_blend_lookup(
             "sparse", list(range(16)), local_hit_tokens=0, cache_salt="tenant"
         )
@@ -89,7 +103,7 @@ class TestSGLangBlendLookup(unittest.TestCase):
             [CBMatchResult(0, 8, 24, 32, b"shifted")],
             [CBMatchResult(16, 24, 16, 24, b"exact")],
         )
-        self.future.result.return_value = result
+        self.future.set_result(result)
         operation = self.connector.submit_blend_lookup(
             "mixed", list(range(32)), local_hit_tokens=8, cache_salt=""
         )
@@ -100,19 +114,159 @@ class TestSGLangBlendLookup(unittest.TestCase):
         self.connector.finish_request("mixed")
         self.client.end_session.assert_called_once_with("mixed")
 
-    def test_cancellation_does_not_poll_or_resubmit_pending_rpc(self) -> None:
-        self.future.query.return_value = False
+    def test_cancellation_waits_for_lookup_reply_without_resubmitting(self) -> None:
         operation = self.connector.submit_blend_lookup(
             "cancelled", list(range(16)), local_hit_tokens=0, cache_salt=""
         )
         self.assertIsNone(self.connector.poll_blend_lookup(operation))
         self.connector.finish_request("cancelled")
-        self.future.query.return_value = True
-        with self.assertRaisesRegex(RuntimeError, "retired"):
-            self.connector.poll_blend_lookup(operation)
-        self.future.result.assert_not_called()
+        self.connector.finish_request("cancelled")
+        try:
+            self.client.end_session.assert_not_called()
+            with self.assertRaisesRegex(RuntimeError, "retired"):
+                self.connector.poll_blend_lookup(operation)
+        finally:
+            self.future.set_result(None)
         self.client.cb_unified_lookup.assert_called_once()
         self.client.end_session.assert_called_once_with("cancelled")
+        self.client.free_lookup_locks.assert_not_called()
+
+    def test_cancellation_releases_unpolled_prefix_before_ending(self) -> None:
+        self.release = MessagingFuture()
+        self.client.free_lookup_locks.return_value = self.release
+        self.connector.submit_blend_lookup(
+            "unpolled", list(range(16)), local_hit_tokens=0, cache_salt="tenant"
+        )
+        self.connector.finish_request("unpolled")
+        self.future.set_result(CBUnifiedLookupResult(16, []))
+        try:
+            self.client.free_lookup_locks.assert_called_once()
+            key, readers = self.client.free_lookup_locks.call_args.args
+            self.assertEqual(
+                (key.start, key.end, key.cache_salt, readers), (0, 16, "tenant", 1)
+            )
+            self.client.end_session.assert_not_called()
+        finally:
+            self.release.set_result(None)
+        self.client.end_session.assert_called_once_with("unpolled")
+
+    def test_cancellation_waits_for_partial_release_and_frees_remainder(self) -> None:
+        partial: MessagingFuture[None] = MessagingFuture()
+        self.client.free_lookup_locks.side_effect = [partial, self.release]
+        self.future.set_result(CBUnifiedLookupResult(16, []))
+        operation = self.connector.submit_blend_lookup(
+            "partial", list(range(16)), local_hit_tokens=0, cache_salt=""
+        )
+        self.connector.poll_blend_lookup(operation)
+        self.connector.free_lookup_locks("partial", 0, 8)
+        self.connector.finish_request("partial")
+        try:
+            self.client.end_session.assert_not_called()
+        finally:
+            partial.set_result(None)
+        ranges = [
+            (call.args[0].start, call.args[0].end)
+            for call in self.client.free_lookup_locks.call_args_list
+        ]
+        self.assertEqual(ranges, [(0, 8), (8, 16)])
+        self.client.end_session.assert_called_once_with("partial")
+
+    def test_finished_load_does_not_release_prefix_twice(self) -> None:
+        self.future.set_result(CBUnifiedLookupResult(16, []))
+        lookup = self.connector.submit_blend_lookup(
+            "loaded", list(range(16)), local_hit_tokens=0, cache_salt=""
+        )
+        self.connector.poll_blend_lookup(lookup)
+        retrieved: MessagingFuture[bool] = MessagingFuture()
+        retrieved.set_result(True)
+        load = LMCacheLoadOperation(
+            "loaded", list(range(16)), 0, 16, 0, torch.arange(16), retrieved, lookup
+        )
+        self.assertTrue(self.connector.complete_load(load))
+        self.connector.finish_request("loaded")
+        self.client.free_lookup_locks.assert_not_called()
+        self.client.end_session.assert_called_once_with("loaded")
+
+    def test_lookup_error_still_ends_session(self) -> None:
+        self.connector.submit_blend_lookup(
+            "failed", list(range(16)), local_hit_tokens=0, cache_salt=""
+        )
+        self.connector.finish_request("failed")
+        self.future.set_exception(ConnectionError("lookup failed"))
+        self.client.end_session.assert_called_once_with("failed")
+        self.client.free_lookup_locks.assert_not_called()
+
+    def test_close_waits_for_session_end_acknowledgement(self) -> None:
+        end_submitted = threading.Event()
+        ended: MessagingFuture[None] = MessagingFuture()
+
+        def end_session(request_id: str) -> MessagingFuture[None]:
+            end_submitted.set()
+            return ended
+
+        self.client.end_session.side_effect = end_session
+        release: MessagingFuture[None] = MessagingFuture()
+        self.client.free_lookup_locks.return_value = release
+        self.connector.submit_blend_lookup(
+            "closing", list(range(16)), local_hit_tokens=0, cache_salt=""
+        )
+        self.connector.finish_request("closing")
+        closing = threading.Thread(target=self.connector.close)
+        closing.start()
+        try:
+            self.client.end_session.assert_not_called()
+            self.client.close.assert_not_called()
+            self.future.set_result(CBUnifiedLookupResult(8, []))
+            self.client.free_lookup_locks.assert_called_once()
+            self.client.end_session.assert_not_called()
+            self.client.close.assert_not_called()
+            release.set_result(None)
+            self.assertTrue(end_submitted.wait(5))
+            self.client.close.assert_not_called()
+        finally:
+            if not self.future.query():
+                self.future.set_result(None)
+            if not release.query():
+                release.set_result(None)
+            ended.set_result(None)
+            closing.join(5)
+        self.assertFalse(closing.is_alive())
+        self.client.close.assert_called_once()
+
+    def test_completed_prefix_is_released_with_or_without_polling(self) -> None:
+        for poll in (False, True):
+            with self.subTest(poll=poll):
+                future: MessagingFuture[CBUnifiedLookupResult | None] = (
+                    MessagingFuture()
+                )
+                future.set_result(CBUnifiedLookupResult(16, []))
+                self.client.cb_unified_lookup.return_value = future
+                self.client.free_lookup_locks.reset_mock()
+                self.client.end_session.reset_mock()
+                request_id = f"completed-{poll}"
+                operation = self.connector.submit_blend_lookup(
+                    request_id, list(range(16)), local_hit_tokens=0, cache_salt=""
+                )
+                if poll:
+                    self.connector.poll_blend_lookup(operation)
+                self.connector.finish_request(request_id)
+                self.client.free_lookup_locks.assert_called_once()
+                key = self.client.free_lookup_locks.call_args.args[0]
+                self.assertEqual((key.start, key.end), (0, 16))
+                self.client.end_session.assert_called_once_with(request_id)
+
+    def test_release_error_still_ends_session(self) -> None:
+        self.release = MessagingFuture()
+        self.client.free_lookup_locks.return_value = self.release
+        self.future.set_result(CBUnifiedLookupResult(8, []))
+        operation = self.connector.submit_blend_lookup(
+            "release-error", list(range(16)), local_hit_tokens=0, cache_salt=""
+        )
+        self.connector.poll_blend_lookup(operation)
+        self.connector.finish_request("release-error")
+        self.client.end_session.assert_not_called()
+        self.release.set_exception(ConnectionError("release failed"))
+        self.client.end_session.assert_called_once_with("release-error")
 
     def test_old_server_rejected_before_lookup(self) -> None:
         self.client.cb_protocol_handshake.return_value.result.return_value = (1, True)

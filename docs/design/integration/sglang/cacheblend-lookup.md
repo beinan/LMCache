@@ -22,7 +22,8 @@ Releasing locks for `[0, 256)` preserves the request's sparse match metadata.
 ```
 submit_blend_lookup -> CB_UNIFIED_LOOKUP
 poll_blend_lookup  -> pending future / pending server prefetch / complete result
-finish_request     -> retire client operation and send END_SESSION once
+finish_request     -> retire client operation -> last lookup reply
+                   -> prefix releases acknowledged -> END_SESSION acknowledged
 ```
 
 A pending server result is polled with a fresh RPC on a later scheduler pass.
@@ -31,11 +32,20 @@ start another server lookup. Retired operations cannot be polled. Empty aligned
 prompts submit no lookup and need no session-ending RPC.
 
 Server teardown disposes pending prefetch results and releases the prefix
-reservations of unfinished lookups. Before enabling the scheduler caller,
-client cancellation must still wait asynchronously for the last lookup RPC
-to settle before sending END_SESSION, and release completed prefix locks that
-no retrieve consumed. Otherwise END_SESSION can arrive before the first
-lookup handler creates its session.
+reservations of unfinished lookups. Client retirement waits asynchronously for
+the last lookup RPC before sending END_SESSION, so a late lookup cannot create
+its session after teardown. If that reply contains a completed prefix, retirement
+releases the prefix range that no retrieve or explicit release consumed. Earlier
+explicit prefix releases must also acknowledge before END_SESSION: their server
+handler needs the session's recorded lock owners.
+
+The scheduler retires local state immediately. Future callbacks advance the RPC
+chain without blocking or editing scheduler dictionaries. One tracked future
+covers the entire chain, so `close` waits for END_SESSION's acknowledgement up
+to the configured RPC timeout before closing the transport. RPC failures are
+logged and teardown is still attempted; a disconnected server cannot guarantee
+remote cleanup. Callers must finish submitted retrieves before retiring the
+request, because H2D completion owns their lock release.
 
 The client tests establish RPC and metadata ownership, not that selective
 generation is complete. Retrieval events, model execution, and TP/PP match

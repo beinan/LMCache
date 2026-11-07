@@ -11,6 +11,7 @@ by SGLang; the selected transfer context moves their KV data.
 from __future__ import annotations
 
 # Standard
+from collections import deque
 from typing import TYPE_CHECKING, Any, Optional, Sequence
 import hashlib
 import logging
@@ -30,11 +31,11 @@ from lmcache.integration.sglang.lmcache_mp_metadata import (
     SGLangKVComponentGroup,
 )
 from lmcache.v1.multiprocess.custom_types import CBUnifiedLookupResult
+from lmcache.v1.multiprocess.futures import MessagingFuture
 
 if TYPE_CHECKING:
     # First Party
     from lmcache.v1.client.worker_transfer import TransferContext
-    from lmcache.v1.multiprocess.futures import MessagingFuture
 
 logger = logging.getLogger(__name__)
 
@@ -1288,9 +1289,10 @@ class UnifiedLMCacheMPConnector:
 
         if self.is_lookup_leader:
             key = self._create_key(operation, start=start, end=end, worker_id=None)
-            self._track_control_future(
-                self._req_client.free_lookup_locks(key, self.kv_world_size)
-            )
+            future = self._req_client.free_lookup_locks(key, self.kv_world_size)
+            self._track_control_future(future)
+            if isinstance(operation, LMCacheBlendLookupOperation):
+                operation.prefix_releases.append(future)
         operation.lock_start = end
         if end == operation.total_hit_tokens:
             operation.locks_held = False
@@ -1298,14 +1300,29 @@ class UnifiedLMCacheMPConnector:
                 self._lookups.pop(request_id, None)
 
     def end_session(self, request_id: str) -> None:
+        """Retire a request, ordering blend teardown after its outstanding RPCs.
+
+        Args:
+            request_id: Request to retire; repeated calls have no effect.
+
+        Notes:
+            Returns without waiting. ``close`` drains the cleanup chain up to
+            the configured RPC timeout. Finish any submitted retrieve before
+            calling this method, so its prefix locks are not released twice.
+        """
         # A local lookup object can represent an aligned-empty lookup for
         # which no LOOKUP RPC was sent. Only _active_sessions proves that a
         # LOOKUP or STORE reached the server and requires END_SESSION.
         was_active = request_id in self._active_sessions
-        self._lookups.pop(request_id, None)
-        if was_active and self.is_lookup_leader:
-            self._track_control_future(self._req_client.end_session(request_id))
+        operation = self._lookups.pop(request_id, None)
         self._active_sessions.discard(request_id)
+        if was_active and self.is_lookup_leader:
+            future = (
+                self._retire_blend_lookup(operation)
+                if isinstance(operation, LMCacheBlendLookupOperation)
+                else self._req_client.end_session(request_id)
+            )
+            self._track_control_future(future)
 
     def finish_request(self, request_id: str) -> None:
         self.end_session(request_id)
@@ -1361,3 +1378,96 @@ class UnifiedLMCacheMPConnector:
         device_module = torch.get_device_module(self.device)
         with device_module.stream(stream):
             return transfer_ctx.create_recorded_event()
+
+    def _retire_blend_lookup(
+        self, operation: LMCacheBlendLookupOperation
+    ) -> MessagingFuture[None]:
+        # The operation is retired on the scheduler thread. Callbacks own only
+        # this snapshot, never the connector's scheduler bookkeeping.
+        completion: MessagingFuture[None] = MessagingFuture()
+        releases = deque(operation.prefix_releases)
+        start = operation.lock_start
+        end = (operation.total_hit_tokens or 0) if operation.locks_held else 0
+        error: Exception | None = None
+
+        def on_end(future: MessagingFuture[None]) -> None:
+            try:
+                future.result(timeout=0)
+            except Exception as exc:
+                logger.exception(
+                    "CacheBlend session end failed for %s", operation.request_id
+                )
+                completion.set_exception(exc)
+            else:
+                if error is not None:
+                    completion.set_exception(error)
+                else:
+                    completion.set_result(None)
+
+        def on_release(future: MessagingFuture[None] | None = None) -> None:
+            nonlocal error
+            # Each callback advances one serial chain; no receiver thread waits
+            # for a response that it must itself deliver.
+            while future is not None:
+                try:
+                    future.result(timeout=0)
+                except Exception as exc:
+                    logger.exception(
+                        "CacheBlend prefix release failed for %s", operation.request_id
+                    )
+                    error = exc
+                future = releases.popleft() if releases else None
+                if future is not None and not future.query():
+                    future.add_done_callback(on_release)
+                    return
+            if releases:
+                releases.popleft().add_done_callback(on_release)
+                return
+            try:
+                self._req_client.end_session(operation.request_id).add_done_callback(
+                    on_end
+                )
+            except Exception as exc:
+                logger.exception(
+                    "CacheBlend session end submission failed for %s",
+                    operation.request_id,
+                )
+                completion.set_exception(exc)
+
+        def on_lookup(future: MessagingFuture[CBUnifiedLookupResult | None]) -> None:
+            nonlocal error
+            remaining_end = end
+            try:
+                result = future.result(timeout=0)
+                if result is not None:
+                    remaining_end = result.prefix_coverage_tokens
+            except Exception as exc:
+                logger.exception(
+                    "CacheBlend lookup failed during retirement for %s",
+                    operation.request_id,
+                )
+                error = exc
+            if start < remaining_end:
+                try:
+                    key = self._create_key(
+                        operation, start=start, end=remaining_end, worker_id=None
+                    )
+                    releases.append(
+                        self._req_client.free_lookup_locks(key, self.kv_world_size)
+                    )
+                except Exception as exc:
+                    logger.exception(
+                        "CacheBlend prefix release submission failed for %s",
+                        operation.request_id,
+                    )
+                    error = exc
+            on_release()
+
+        lookup = operation.submission_future
+        if lookup is None:
+            # A consumed lookup uses the remaining lock snapshot, including
+            # ranges already released or consumed by a completed retrieve.
+            lookup = MessagingFuture()
+            lookup.set_result(None)
+        lookup.add_done_callback(on_lookup)
+        return completion

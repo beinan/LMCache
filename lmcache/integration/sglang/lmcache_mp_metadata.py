@@ -2,7 +2,7 @@
 """Metadata shared by the SGLang unified LMCache integration."""
 
 # Standard
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
 # Third Party
@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 
     # First Party
     from lmcache.v1.multiprocess.custom_types import CBUnifiedLookupResult
+    from lmcache.v1.multiprocess.futures import MessagingFuture
 
 
 @dataclass
@@ -42,6 +43,7 @@ class LMCacheBlendLookupOperation(LMCacheLookupOperation):
     """
 
     blend_result: Optional["CBUnifiedLookupResult"] = None
+    prefix_releases: list["MessagingFuture[None]"] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
