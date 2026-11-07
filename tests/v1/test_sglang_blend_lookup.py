@@ -24,17 +24,6 @@ from lmcache.v1.multiprocess.futures import MessagingFuture
 
 class TestSGLangBlendLookup(unittest.TestCase):
     def setUp(self) -> None:
-        tensors = tuple(torch.empty(32, 2, 8) for _ in range(2))
-        adapter = Mock()
-        adapter.resolve_registered_groups.return_value = [
-            SGLangKVComponentGroup("full", tensors, rope_num_layers=1)
-        ]
-        adapter.is_mla_enabled.return_value = False
-        module_name = "lmcache.integration.sglang.unified_kv_adapter"
-        adapter_module = ModuleType(module_name)
-        vars(adapter_module)["SGLangUnifiedKVAdapter"] = Mock(return_value=adapter)
-        config = SimpleNamespace(mp_host="127.0.0.1", mp_port=5555)
-        config.get_extra_config_value = lambda _key, default: default
         self.client = Mock()
         self.client.get_chunk_size.return_value.result.return_value = 8
         self.client.cb_protocol_handshake.return_value.result.return_value = (2, True)
@@ -46,32 +35,16 @@ class TestSGLangBlendLookup(unittest.TestCase):
         self.ended: MessagingFuture[None] = MessagingFuture()
         self.ended.set_result(None)
         self.client.end_session.return_value = self.ended
-        with (
-            patch.dict("sys.modules", {module_name: adapter_module}),
-            patch(
-                "lmcache.v1.client.client_config.load_mp_client_config",
-                return_value=config,
-            ),
-            patch(
-                "lmcache.v1.multiprocess.transport.factory.RequestClientFactory.create",
-                return_value=self.client,
-            ),
-            patch("lmcache.v1.client.worker_transfer.create_transfer_context"),
-        ):
-            self.connector = UnifiedLMCacheMPConnector(
-                config_file=None,
-                model_config=SimpleNamespace(model_path="test-model"),
-                tp_size=1,
-                tp_rank=0,
-                tp_group=None,
-                page_size=4,
-                token_to_kv_pool_allocator=object(),
-                req_to_token_pool=object(),
-                tree_components=(object(),),
-                mamba_component=None,
-                sliding_window_size=None,
-            )
-        self.addCleanup(self.connector.close)
+        self.transfer = Mock()
+        self.connector = self._make_connector(
+            [
+                SGLangKVComponentGroup(
+                    "full",
+                    tuple(torch.empty(32, 2, 8) for _ in range(2)),
+                    rope_num_layers=1,
+                )
+            ]
+        )
 
     def test_sparse_only_hit_survives_pending_polls_and_finishes_once(self) -> None:
         result = CBUnifiedLookupResult(0, [CBMatchResult(0, 8, 8, 16, b"hash")])
@@ -288,3 +261,159 @@ class TestSGLangBlendLookup(unittest.TestCase):
         self.connector.finish_request("short")
         self.client.cb_unified_lookup.assert_not_called()
         self.client.end_session.assert_not_called()
+
+    def test_sparse_retrieve_uses_engine_group_tables_and_preserves_prefix(
+        self,
+    ) -> None:
+        connector = self._make_connector(
+            [
+                SGLangKVComponentGroup(
+                    f"full-{i}",
+                    tuple(torch.empty(128, heads, head) for heads in head_counts),
+                    rope_num_layers=len(head_counts) // 2,
+                )
+                for i, (head, head_counts) in enumerate(
+                    ((8, (2, 4, 2, 4)), (16, (2, 2)))
+                )
+            ]
+        )
+        registered = self.transfer.register.call_args.kwargs["engine_group_infos"]
+        self.assertEqual([group.engine_group_id for group in registered], [0, 0, 1])
+        table = torch.ones(64, 4)
+        connector.register_blend_rope(table, is_neox_style=True)
+        args = self.transfer.register_blend_rope.call_args.args
+        self.assertIs(args[0][0], table)
+        self.assertEqual(args[1:6], (8, True, [0, 0], [[0, 4], [0, 4]], [8, 16]))
+        sparse = CBMatchResult(0, 8, 24, 32, b"sparse")
+        exact = CBMatchResult(16, 24, 16, 24, b"exact")
+        self.future.set_result(CBUnifiedLookupResult(8, [sparse], [exact]))
+        lookup = connector.submit_blend_lookup(
+            "retrieve", list(range(32)), local_hit_tokens=0, cache_salt="tenant"
+        )
+        connector.poll_blend_lookup(lookup)
+        completed: MessagingFuture[bool] = MessagingFuture()
+        completed.set_result(True)
+        self.transfer.submit_blend_retrieve.return_value = completed
+        result = connector.submit_blend_retrieve(
+            lookup, [torch.arange(32, 64), torch.arange(64, 96)]
+        )
+        self.assertIs(result, completed)
+        key, matches, blocks, event = self.transfer.submit_blend_retrieve.call_args.args
+        self.assertEqual(
+            (key.start, key.end, key.worker_id, key.cache_salt), (0, 32, 0, "tenant")
+        )
+        self.assertEqual(matches, [sparse, exact])
+        self.assertEqual(blocks, [list(range(8, 16)), list(range(16, 24))])
+        self.assertIs(event, self.transfer.create_recorded_event.return_value)
+        self.assertTrue(result.result(timeout=0))
+        connector.finish_request("retrieve")
+        self.client.free_lookup_locks.assert_called_once()
+        key = self.client.free_lookup_locks.call_args.args[0]
+        self.assertEqual((key.start, key.end), (0, 8))
+
+    def test_sparse_retrieve_requires_owned_matches_and_complete_allocation(
+        self,
+    ) -> None:
+        match = CBMatchResult(0, 8, 8, 16, b"sparse")
+        self.future.set_result(CBUnifiedLookupResult(0, [match]))
+        lookup = self.connector.submit_blend_lookup(
+            "subset", list(range(16)), local_hit_tokens=0, cache_salt=""
+        )
+        with self.assertRaisesRegex(RuntimeError, "completed lookup"):
+            self.connector.submit_blend_retrieve(lookup, torch.arange(16))
+        self.connector.poll_blend_lookup(lookup)
+        with self.assertRaisesRegex(RuntimeError, "register_blend_rope"):
+            self.connector.submit_blend_retrieve(lookup, torch.arange(16))
+        self.connector.register_blend_rope(None, is_neox_style=True)
+        with self.assertRaisesRegex(ValueError, "cover every selected match"):
+            self.connector.submit_blend_retrieve(lookup, torch.arange(8))
+        for slots in (
+            torch.cat((torch.arange(8, 16), torch.arange(8))),
+            torch.arange(32, 48),
+        ):
+            with (
+                self.subTest(slots=slots),
+                self.assertRaisesRegex(ValueError, "non-padding"),
+            ):
+                self.connector.submit_blend_retrieve(lookup, slots)
+        for matches in ([match, match], [CBMatchResult(0, 8, 8, 16, b"foreign")]):
+            with (
+                self.subTest(matches=matches),
+                self.assertRaisesRegex(ValueError, "distinct matches"),
+            ):
+                self.connector.submit_blend_retrieve(
+                    lookup, torch.arange(16), matches=matches
+                )
+        self.assertTrue(
+            self.connector.submit_blend_retrieve(
+                lookup, torch.arange(16), matches=[]
+            ).result(0)
+        )
+        self.transfer.submit_blend_retrieve.assert_not_called()
+        self.connector.finish_request("subset")
+        with self.assertRaisesRegex(RuntimeError, "retired"):
+            self.connector.submit_blend_retrieve(lookup, torch.arange(16))
+
+    def test_rope_registration_rejects_invalid_geometry_and_failed_ack(self) -> None:
+        for shape in ((8,), (16, 0), (16, 3), (16, 10)):
+            with self.subTest(shape=shape), self.assertRaises(ValueError):
+                self.connector.register_blend_rope(
+                    torch.empty(shape), is_neox_style=True
+                )
+        self.transfer.register_blend_rope.assert_not_called()
+        self.transfer.register_blend_rope.side_effect = ConnectionError(
+            "registration failed"
+        )
+        with self.assertRaises(ConnectionError):
+            self.connector.register_blend_rope(None, is_neox_style=True)
+        self.future.set_result(
+            CBUnifiedLookupResult(0, [CBMatchResult(0, 8, 8, 16, b"h")])
+        )
+        lookup = self.connector.submit_blend_lookup(
+            "failed-rope", list(range(16)), local_hit_tokens=0, cache_salt=""
+        )
+        self.connector.poll_blend_lookup(lookup)
+        with self.assertRaisesRegex(RuntimeError, "register_blend_rope"):
+            self.connector.submit_blend_retrieve(lookup, torch.arange(16))
+
+    def _make_connector(
+        self, groups: list[SGLangKVComponentGroup]
+    ) -> UnifiedLMCacheMPConnector:
+        adapter = Mock()
+        adapter.resolve_registered_groups.return_value = groups
+        adapter.is_mla_enabled.return_value = False
+        module_name = "lmcache.integration.sglang.unified_kv_adapter"
+        adapter_module = ModuleType(module_name)
+        vars(adapter_module)["SGLangUnifiedKVAdapter"] = Mock(return_value=adapter)
+        config = SimpleNamespace(mp_host="127.0.0.1", mp_port=5555)
+        config.get_extra_config_value = lambda _key, default: default
+        with (
+            patch.dict("sys.modules", {module_name: adapter_module}),
+            patch(
+                "lmcache.v1.client.client_config.load_mp_client_config",
+                return_value=config,
+            ),
+            patch(
+                "lmcache.v1.multiprocess.transport.factory.RequestClientFactory.create",
+                return_value=self.client,
+            ),
+            patch(
+                "lmcache.v1.client.worker_transfer.create_transfer_context",
+                return_value=self.transfer,
+            ),
+        ):
+            connector = UnifiedLMCacheMPConnector(
+                config_file=None,
+                model_config=SimpleNamespace(model_path="test-model"),
+                tp_size=1,
+                tp_rank=0,
+                tp_group=None,
+                page_size=4,
+                token_to_kv_pool_allocator=object(),
+                req_to_token_pool=object(),
+                tree_components=(object(),),
+                mamba_component=None,
+                sliding_window_size=None,
+            )
+        self.addCleanup(connector.close)
+        return connector

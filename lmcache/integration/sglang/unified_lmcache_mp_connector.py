@@ -30,7 +30,7 @@ from lmcache.integration.sglang.lmcache_mp_metadata import (
     LMCacheStoreOperation,
     SGLangKVComponentGroup,
 )
-from lmcache.v1.multiprocess.custom_types import CBUnifiedLookupResult
+from lmcache.v1.multiprocess.custom_types import CBMatchResult, CBUnifiedLookupResult
 from lmcache.v1.multiprocess.futures import MessagingFuture
 
 if TYPE_CHECKING:
@@ -41,6 +41,10 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_MQ_TIMEOUT_SECONDS = 300.0
 _DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 10.0
+
+
+def _blend_match_key(match: CBMatchResult) -> tuple[int, int, int, int, bytes]:
+    return match.old_st, match.old_ed, match.cur_st, match.cur_ed, match.hash
 
 
 class _ImmediateFuture:
@@ -296,6 +300,7 @@ class UnifiedLMCacheMPConnector:
         self._req_client = RequestClientFactory.create(self.server_url)
         self._transfer_ctx: Optional["TransferContext"] = None
         self._blend_protocol_ready = False
+        self._blend_rope_registered = False
         self._registered = False
         self._is_kv_writer = True
         self._closed = False
@@ -670,26 +675,9 @@ class UnifiedLMCacheMPConnector:
             RuntimeError: Duplicate request or server without protocol v2.
             TimeoutError: Protocol handshake exceeds the operation timeout.
         """
-        if (
-            self.kv_world_size != 1
-            or self.mla_enabled
-            or any(
-                group.recurrent_state
-                or group.sliding_window_size >= 0
-                or group.rope_num_layers is None
-                for group in self._kv_groups
-            )
-        ):
-            raise NotImplementedError("CacheBlend lookup requires single-rank full MHA")
         if request_id in self._lookups:
             raise RuntimeError(f"LMCache lookup already exists for {request_id}")
-        if not self._blend_protocol_ready:
-            version, compatible = self._req_client.cb_protocol_handshake(2).result(
-                timeout=self._mq_timeout
-            )
-            if version < 2 or not compatible:
-                raise RuntimeError("SGLang CacheBlend requires server protocol v2")
-            self._blend_protocol_ready = True
+        self._ensure_blend_protocol()
         self._ensure_heartbeat_started()
         operation = LMCacheBlendLookupOperation(
             request_id=request_id,
@@ -759,6 +747,149 @@ class UnifiedLMCacheMPConnector:
             operation.total_hit_tokens = result.prefix_coverage_tokens
             operation.locks_held = result.prefix_coverage_tokens > 0
         return result
+
+    def register_blend_rope(
+        self, cos_sin_cache: torch.Tensor | None, *, is_neox_style: bool
+    ) -> None:
+        """Register one rotary table shared by the full-MHA layers.
+
+        Args:
+            cos_sin_cache: Model-owned [position, rotary dimension] table with
+                concatenated cosine/sine halves on the KV device, or None for
+                NoPE. Keep it alive until connector shutdown.
+            is_neox_style: Whether rotary pairs use contiguous halves.
+
+        Raises:
+            ValueError: Invalid table geometry or device.
+            NotImplementedError: Unsupported layout or transfer context.
+            RuntimeError: KV registration is absent or protocol v2 unavailable.
+            TimeoutError: Registration or handshake exceeds the RPC timeout.
+
+        Call during model initialization, before submitting blend retrieves.
+        Models with distinct per-layer rotary tables need separate registration
+        metadata and are not represented by this shared-table API.
+        """
+        self._ensure_blend_protocol()
+        transfer_ctx = self._transfer_ctx
+        if transfer_ctx is None:
+            raise RuntimeError("LMCache KV tensors are not registered")
+        head_sizes = [int(group.kv_tensors[0].shape[-1]) for group in self._kv_groups]
+        if cos_sin_cache is not None:
+            if (
+                cos_sin_cache.ndim != 2
+                or cos_sin_cache.shape[1] == 0
+                or cos_sin_cache.shape[1] % 2
+                or cos_sin_cache.shape[1] > min(head_sizes)
+                or cos_sin_cache.device != self.device
+            ):
+                raise ValueError(
+                    "RoPE table must have even width within each KV head on its device"
+                )
+            width = int(cos_sin_cache.shape[1])
+            caches = [cos_sin_cache]
+            group_to_cache = [0] * len(head_sizes)
+            group_rot = [[0, width] for _ in head_sizes]
+        else:
+            caches = []
+            group_to_cache = [-1] * len(head_sizes)
+            group_rot = [[] for _ in head_sizes]
+        self._blend_rope_registered = False
+        transfer_ctx.register_blend_rope(
+            caches,
+            head_sizes[0],
+            is_neox_style,
+            group_to_cache,
+            group_rot,
+            head_sizes,
+            self._mq_timeout,
+        )
+        self._blend_rope_registered = True
+
+    def submit_blend_retrieve(
+        self,
+        operation: LMCacheBlendLookupOperation,
+        device_indices: list[torch.Tensor] | torch.Tensor,
+        *,
+        matches: Sequence[CBMatchResult] | None = None,
+        producer_stream: Any = None,
+    ) -> MessagingFuture[bool]:
+        """Load selected sparse matches into fully allocated SGLang pages.
+
+        Args:
+            operation: Live, completed blend lookup for this request.
+            device_indices: Full request slot table per engine group, padded
+                to complete physical pages; not just the matched positions.
+            matches: Subset of the lookup's matches to load. None selects all
+                non-prefix and segmented-prefix matches.
+            producer_stream: Stream whose work must precede the KV writes.
+
+        Returns:
+            Device-aware future. Wait on the forward stream before consuming
+            KV, and retain the future and destination allocations until device
+            completion. False requires recomputation. Complete this future
+            before finishing the request; do not pass it to complete_load,
+            which consumes contiguous-prefix lock ownership.
+
+        Raises:
+            RuntimeError: Retired/incomplete lookup or missing RoPE registration.
+            ValueError: Foreign/duplicate matches or insufficient/invalid pages.
+            NotImplementedError: The transfer context does not support blending.
+        """
+        if self._lookups.get(operation.request_id) is not operation:
+            raise RuntimeError("Cannot retrieve a retired CacheBlend lookup")
+        result = operation.blend_result
+        if result is None:
+            raise RuntimeError("CacheBlend retrieve requires a completed lookup")
+        transfer_ctx = self._transfer_ctx
+        if transfer_ctx is None or not self._blend_rope_registered:
+            raise RuntimeError("Call register_blend_rope before CacheBlend retrieve")
+        available = [*result.non_prefix_segments, *result.segmented_prefix_segments]
+        selected = available if matches is None else list(matches)
+        available_keys = {_blend_match_key(match) for match in available}
+        selected_keys = {_blend_match_key(match) for match in selected}
+        if not selected_keys <= available_keys or len(selected_keys) != len(selected):
+            raise ValueError(
+                "Select distinct matches from this lookup's prefetched result"
+            )
+        group_indices = self._normalize_group_indices(device_indices)
+        required_tokens = max((match.cur_ed for match in selected), default=0)
+        block_ids = []
+        for group, indices in zip(self._kv_groups, group_indices, strict=True):
+            covered_tokens = (
+                indices.numel() // group.slots_per_block * group.tokens_per_block
+            )
+            if covered_tokens < required_tokens:
+                raise ValueError("Destination pages must cover every selected match")
+            blocks = self._slots_to_blocks(
+                indices, slots_per_block=group.slots_per_block
+            )
+            for match in selected:
+                first = match.cur_st // group.tokens_per_block
+                last = (
+                    match.cur_ed + group.tokens_per_block - 1
+                ) // group.tokens_per_block
+                if any(
+                    not 0 < block < group.kv_tensors[0].shape[0]
+                    for block in blocks[first:last]
+                ):
+                    raise ValueError(
+                        "Matched destinations must be valid non-padding KV pages"
+                    )
+            block_ids.append(blocks)
+        if not selected:
+            completed: MessagingFuture[bool] = MessagingFuture()
+            completed.set_result(True)
+            return completed
+        key = self._create_key(
+            operation,
+            start=0,
+            end=len(operation.token_ids),
+            worker_id=self.kv_worker_id,
+        )
+        event = self._create_recorded_event(transfer_ctx, producer_stream)
+        future = transfer_ctx.submit_blend_retrieve(key, selected, block_ids, event)
+        future.retain_reference(group_indices)
+        return future
 
     def poll_lookup(self, operation: LMCacheLookupOperation) -> Optional[int]:
         """Return contiguous prefix coverage, or None while prefetch runs.
@@ -1471,3 +1602,23 @@ class UnifiedLMCacheMPConnector:
             lookup.set_result(None)
         lookup.add_done_callback(on_lookup)
         return completion
+
+    def _ensure_blend_protocol(self) -> None:
+        if (
+            self.kv_world_size != 1
+            or self.mla_enabled
+            or any(
+                group.recurrent_state
+                or group.sliding_window_size >= 0
+                or group.rope_num_layers is None
+                for group in self._kv_groups
+            )
+        ):
+            raise NotImplementedError("CacheBlend requires single-rank full MHA")
+        if not self._blend_protocol_ready:
+            version, compatible = self._req_client.cb_protocol_handshake(2).result(
+                timeout=self._mq_timeout
+            )
+            if version < 2 or not compatible:
+                raise RuntimeError("SGLang CacheBlend requires server protocol v2")
+            self._blend_protocol_ready = True

@@ -1,4 +1,4 @@
-# Request-owned CacheBlend lookup
+# Request-owned CacheBlend lookup and retrieve
 
 The explicit `submit_blend_lookup` / `poll_blend_lookup` API prepares matches
 for selective prefill. It is not enabled by the existing unified radix-cache
@@ -48,5 +48,34 @@ remote cleanup. Callers must finish submitted retrieves before retiring the
 request, because H2D completion owns their lock release.
 
 The client tests establish RPC and metadata ownership, not that selective
-generation is complete. Retrieval events, model execution, and TP/PP match
-distribution remain separate integration work.
+generation is complete. Model execution and TP/PP match distribution remain
+separate integration work.
+
+## Explicit rotary registration and sparse retrieve
+
+`register_blend_rope(table, is_neox_style=...)` registers a model-owned rotary
+cache shared by the full-MHA layers. The table contains concatenated cosine/sine
+halves; its width is the rotary dimension, while each group's head dimension
+comes from the registered KV shape. `None` represents NoPE. Distinct per-layer
+rotary tables require a different grouping contract and are not represented by
+this shared-table entry point.
+
+After a completed lookup, `submit_blend_retrieve` accepts full request slot
+tables, padded to physical pages, plus an optional subset of prefetched matches.
+It includes segmented-prefix matches by default. It requires the destination to
+cover every selected match and rejects padding/out-of-range destination pages.
+This prevents interpreting the server's beyond-allocation deferral as completed
+KV population. Block tables remain in **engine group** order; ordinary transfer
+helpers expand tables to kernel-group order and must not be used here.
+
+The returned future orders KV writes after a producer event and supports
+`wait_on_stream` before selective model execution. Retain the future and the
+allocation until device completion, then finish the request. Sparse completion
+does not consume contiguous-prefix locks; `complete_load` applies only to the
+separate prefix retrieve. Selecting no matches returns a completed future and
+leaves cleanup to request retirement.
+
+These methods are opt-in connector plumbing. Normal SGLang scheduling still
+needs to select recomputation tokens, restore residuals, and keep retrieved
+slots alive throughout selective execution. A successful transfer does not
+establish generation quality or a latency improvement.
