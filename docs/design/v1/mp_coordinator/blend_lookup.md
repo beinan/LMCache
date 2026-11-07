@@ -108,6 +108,10 @@ Session destruction drops unconsumed coordinator match state, including on
 TTL expiry. A late HTTP response cannot restore a cleared result; cleanup
 does not wait for that response.
 
+Coordinator responses belong to individual submissions. After `take_match`
+clears a timed-out or consumed query, reusing its request ID starts a new
+query; a late response from the old submission cannot complete it.
+
 **Why fleet-only rather than additive.** With event reporting on, this
 server's own stores reach the fleet index through the same event stream,
 so the fleet index already holds what the local matcher would find; a
