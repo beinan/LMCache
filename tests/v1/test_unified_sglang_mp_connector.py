@@ -673,6 +673,7 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
         sends no STORE but still returns an operation for the completion
         collectives."""
         connector = object.__new__(UnifiedLMCacheMPConnector)
+        connector._lookups = {}
         connector.page_size = 4
         connector.chunk_size = 8
         connector.blocks_in_chunk = 2
@@ -705,6 +706,7 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
 
     def test_submit_store_passes_list_of_block_ids_per_group(self):
         connector = object.__new__(UnifiedLMCacheMPConnector)
+        connector._lookups = {}
         connector.page_size = 4
         connector.chunk_size = 8
         connector.blocks_in_chunk = 2
@@ -754,6 +756,7 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
 
     def test_submit_store_accepts_suffix_indices_after_cached_prefix(self):
         connector = object.__new__(UnifiedLMCacheMPConnector)
+        connector._lookups = {}
         connector.page_size = 4
         connector.chunk_size = 8
         connector.blocks_in_chunk = 2
@@ -812,6 +815,7 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
 
     def test_submit_store_accepts_all_null_historical_swa_chunk(self):
         connector = object.__new__(UnifiedLMCacheMPConnector)
+        connector._lookups = {}
         connector.page_size = 4
         connector.chunk_size = 8
         connector.blocks_in_chunk = 2
@@ -856,6 +860,7 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
 
     def test_submit_store_defers_partly_unmapped_retained_swa_chunk(self):
         connector = object.__new__(UnifiedLMCacheMPConnector)
+        connector._lookups = {}
         connector.page_size = 4
         connector.chunk_size = 8
         connector._kv_groups = (
@@ -890,6 +895,7 @@ class TestUnifiedLMCacheMPConnector(unittest.TestCase):
 
     def test_submit_store_accepts_dummy_mamba_blocks(self):
         connector = object.__new__(UnifiedLMCacheMPConnector)
+        connector._lookups = {}
         connector.page_size = 1
         connector.chunk_size = 8
         connector.blocks_in_chunk = 8

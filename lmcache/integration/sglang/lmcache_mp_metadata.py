@@ -40,8 +40,13 @@ class LMCacheBlendLookupOperation(LMCacheLookupOperation):
     ``total_hit_tokens`` still counts only the contiguous prefix. The result
     remains attached to this operation until the caller finishes the request;
     it must not be published as a prefix-cache entry.
+
+    ``session_id`` identifies this request incarnation on the server, while
+    ``request_id`` remains the engine's identifier, which may be reused after
+    retirement. Cleanup callbacks retain this operation's session ID.
     """
 
+    session_id: str = field(kw_only=True)
     blend_result: Optional["CBUnifiedLookupResult"] = None
     prefix_releases: list["MessagingFuture[None]"] = field(default_factory=list)
 

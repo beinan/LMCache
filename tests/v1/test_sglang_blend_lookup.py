@@ -66,7 +66,9 @@ class TestSGLangBlendLookup(unittest.TestCase):
         self.assertEqual(key.cache_salt, "tenant")
         self.connector.finish_request("sparse")
         self.connector.finish_request("sparse")
-        self.client.end_session.assert_called_once_with("sparse")
+        self.client.end_session.assert_called_once_with(
+            self.client.cb_unified_lookup.call_args.args[0].request_id
+        )
         with self.assertRaisesRegex(RuntimeError, "retired"):
             self.connector.poll_blend_lookup(operation)
 
@@ -85,7 +87,9 @@ class TestSGLangBlendLookup(unittest.TestCase):
         self.assertIs(self.connector.poll_blend_lookup(operation), result)
         self.assertEqual(operation.total_hit_tokens, 8)
         self.connector.finish_request("mixed")
-        self.client.end_session.assert_called_once_with("mixed")
+        self.client.end_session.assert_called_once_with(
+            self.client.cb_unified_lookup.call_args.args[0].request_id
+        )
 
     def test_cancellation_waits_for_lookup_reply_without_resubmitting(self) -> None:
         operation = self.connector.submit_blend_lookup(
@@ -101,7 +105,9 @@ class TestSGLangBlendLookup(unittest.TestCase):
         finally:
             self.future.set_result(None)
         self.client.cb_unified_lookup.assert_called_once()
-        self.client.end_session.assert_called_once_with("cancelled")
+        self.client.end_session.assert_called_once_with(
+            self.client.cb_unified_lookup.call_args.args[0].request_id
+        )
         self.client.free_lookup_locks.assert_not_called()
 
     def test_cancellation_releases_unpolled_prefix_before_ending(self) -> None:
@@ -121,7 +127,120 @@ class TestSGLangBlendLookup(unittest.TestCase):
             self.client.end_session.assert_not_called()
         finally:
             self.release.set_result(None)
-        self.client.end_session.assert_called_once_with("unpolled")
+        self.client.end_session.assert_called_once_with(
+            self.client.cb_unified_lookup.call_args.args[0].request_id
+        )
+
+    def test_reused_id_isolates_old_cleanup_from_new_transfers(self) -> None:
+        old_end: MessagingFuture[None] = MessagingFuture()
+        self.client.end_session.side_effect = [old_end, self.ended]
+        self.connector.submit_blend_lookup(
+            "reuse", list(range(16)), local_hit_tokens=0, cache_salt="tenant"
+        )
+        old_key = self.client.cb_unified_lookup.call_args.args[0]
+        self.connector.finish_request("reuse")
+        new_reply: MessagingFuture[CBUnifiedLookupResult | None] = MessagingFuture()
+        new_reply.set_result(CBUnifiedLookupResult(8, []))
+        self.client.cb_unified_lookup.return_value = new_reply
+        new_lookup = self.connector.submit_blend_lookup(
+            "reuse", list(range(16, 32)), local_hit_tokens=0, cache_salt="tenant"
+        )
+        new_key = self.client.cb_unified_lookup.call_args.args[0]
+        try:
+            self.assertNotEqual(old_key.request_id, new_key.request_id)
+            self.assertEqual(new_lookup.request_id, "reuse")
+            self.future.set_result(CBUnifiedLookupResult(16, []))
+            released_key = self.client.free_lookup_locks.call_args.args[0]
+            self.assertEqual(released_key.request_id, old_key.request_id)
+            self.client.end_session.assert_called_once_with(old_key.request_id)
+            self.assertEqual(self.connector.poll_lookup(new_lookup), 8)
+
+            transferred: MessagingFuture[bool] = MessagingFuture()
+            transferred.set_result(True)
+            self.transfer.submit_retrieve.return_value = transferred
+            loaded = self.connector.submit_load(
+                new_lookup, torch.arange(8, 16), local_hit_tokens=0
+            )
+            load_args = self.transfer.submit_retrieve.call_args.args
+            self.assertEqual(
+                (load_args[0], load_args[1].request_id), ("reuse", new_key.request_id)
+            )
+            self.assertTrue(self.connector.complete_load(loaded))
+
+            self.transfer.submit_store.return_value = transferred
+            stored = self.connector.submit_store(
+                "reuse",
+                list(range(16, 32)),
+                torch.arange(8, 24),
+                device_indices_start=0,
+                cache_salt="tenant",
+            )
+            assert stored is not None
+            self.assertEqual(stored.request_id, "reuse")
+            self.assertTrue(self.connector.complete_store(stored))
+            store_key = self.transfer.submit_store.call_args.args[1]
+            self.assertEqual(store_key.request_id, new_key.request_id)
+            old_end.set_result(None)
+            self.assertEqual(self.connector.poll_lookup(new_lookup), 8)
+            self.connector.finish_request("reuse")
+            self.client.end_session.assert_called_with(new_key.request_id)
+            self.assertEqual(self.client.end_session.call_count, 2)
+        finally:
+            if not self.future.query():
+                self.future.set_result(None)
+            if not old_end.query():
+                old_end.set_result(None)
+
+    def test_short_blend_request_keeps_its_session_for_later_store(self) -> None:
+        old_end: MessagingFuture[None] = MessagingFuture()
+        self.client.end_session.side_effect = [old_end, self.ended]
+        transferred: MessagingFuture[bool] = MessagingFuture()
+        transferred.set_result(True)
+        self.transfer.submit_store.return_value = transferred
+        sessions: list[str] = []
+        try:
+            for offset in (0, 8):
+                lookup = self.connector.submit_blend_lookup(
+                    "growing", [offset], local_hit_tokens=0, cache_salt="tenant"
+                )
+                self.assertEqual(self.connector.poll_lookup(lookup), 0)
+                stored = self.connector.submit_store(
+                    "growing",
+                    list(range(offset, offset + 8)),
+                    torch.arange(8, 16),
+                    device_indices_start=0,
+                    cache_salt="tenant",
+                )
+                assert stored is not None
+                self.assertTrue(self.connector.complete_store(stored))
+                store_key = self.transfer.submit_store.call_args.args[1]
+                sessions.append(store_key.request_id)
+                self.connector.finish_request("growing")
+                self.client.end_session.assert_called_with(store_key.request_id)
+            self.client.cb_unified_lookup.assert_not_called()
+            self.assertNotEqual(*sessions)
+        finally:
+            old_end.set_result(None)
+
+    def test_blend_lookup_cannot_replace_a_live_store_session(self) -> None:
+        transferred: MessagingFuture[bool] = MessagingFuture()
+        transferred.set_result(True)
+        self.transfer.submit_store.return_value = transferred
+        stored = self.connector.submit_store(
+            "stored",
+            list(range(8)),
+            torch.arange(8, 16),
+            device_indices_start=0,
+            cache_salt="tenant",
+        )
+        assert stored is not None
+        self.assertTrue(self.connector.complete_store(stored))
+        with self.assertRaisesRegex(RuntimeError, "already exists"):
+            self.connector.submit_blend_lookup(
+                "stored", list(range(8)), local_hit_tokens=0, cache_salt="tenant"
+            )
+        self.connector.finish_request("stored")
+        self.client.end_session.assert_called_once_with("stored")
 
     def test_cancellation_waits_for_partial_release_and_frees_remainder(self) -> None:
         partial: MessagingFuture[None] = MessagingFuture()
@@ -142,7 +261,9 @@ class TestSGLangBlendLookup(unittest.TestCase):
             for call in self.client.free_lookup_locks.call_args_list
         ]
         self.assertEqual(ranges, [(0, 8), (8, 16)])
-        self.client.end_session.assert_called_once_with("partial")
+        self.client.end_session.assert_called_once_with(
+            self.client.cb_unified_lookup.call_args.args[0].request_id
+        )
 
     def test_finished_load_does_not_release_prefix_twice(self) -> None:
         self.future.set_result(CBUnifiedLookupResult(16, []))
@@ -158,7 +279,9 @@ class TestSGLangBlendLookup(unittest.TestCase):
         self.assertTrue(self.connector.complete_load(load))
         self.connector.finish_request("loaded")
         self.client.free_lookup_locks.assert_not_called()
-        self.client.end_session.assert_called_once_with("loaded")
+        self.client.end_session.assert_called_once_with(
+            self.client.cb_unified_lookup.call_args.args[0].request_id
+        )
 
     def test_lookup_error_still_ends_session(self) -> None:
         self.connector.submit_blend_lookup(
@@ -166,7 +289,9 @@ class TestSGLangBlendLookup(unittest.TestCase):
         )
         self.connector.finish_request("failed")
         self.future.set_exception(ConnectionError("lookup failed"))
-        self.client.end_session.assert_called_once_with("failed")
+        self.client.end_session.assert_called_once_with(
+            self.client.cb_unified_lookup.call_args.args[0].request_id
+        )
         self.client.free_lookup_locks.assert_not_called()
 
     def test_close_waits_for_session_end_acknowledgement(self) -> None:
@@ -226,7 +351,9 @@ class TestSGLangBlendLookup(unittest.TestCase):
                 self.client.free_lookup_locks.assert_called_once()
                 key = self.client.free_lookup_locks.call_args.args[0]
                 self.assertEqual((key.start, key.end), (0, 16))
-                self.client.end_session.assert_called_once_with(request_id)
+                self.client.end_session.assert_called_once_with(
+                    self.client.cb_unified_lookup.call_args.args[0].request_id
+                )
 
     def test_release_error_still_ends_session(self) -> None:
         self.release = MessagingFuture()
@@ -239,7 +366,9 @@ class TestSGLangBlendLookup(unittest.TestCase):
         self.connector.finish_request("release-error")
         self.client.end_session.assert_not_called()
         self.release.set_exception(ConnectionError("release failed"))
-        self.client.end_session.assert_called_once_with("release-error")
+        self.client.end_session.assert_called_once_with(
+            self.client.cb_unified_lookup.call_args.args[0].request_id
+        )
 
     def test_old_server_rejected_before_lookup(self) -> None:
         self.client.cb_protocol_handshake.return_value.result.return_value = (1, True)
@@ -299,6 +428,9 @@ class TestSGLangBlendLookup(unittest.TestCase):
         )
         self.assertIs(result, completed)
         key, matches, blocks, event = self.transfer.submit_blend_retrieve.call_args.args
+        self.assertEqual(
+            key.request_id, self.client.cb_unified_lookup.call_args.args[0].request_id
+        )
         self.assertEqual(
             (key.start, key.end, key.worker_id, key.cache_salt), (0, 32, 0, "tenant")
         )

@@ -584,6 +584,7 @@ class UnifiedLMCacheMPConnector:
         worker_id: Optional[int],
         request_configs: Optional[dict[str, Any]] = None,
     ) -> Any:
+        """Build a key using the operation's stable server session identity."""
         # First Party
         from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 
@@ -594,7 +595,11 @@ class UnifiedLMCacheMPConnector:
             token_ids=operation.token_ids,
             start=start,
             end=end,
-            request_id=operation.request_id,
+            request_id=(
+                operation.session_id
+                if isinstance(operation, LMCacheBlendLookupOperation)
+                else operation.request_id
+            ),
             cache_salt=operation.cache_salt,
             request_configs=request_configs,
         )
@@ -669,18 +674,21 @@ class UnifiedLMCacheMPConnector:
         Returns:
             Operation to pass to ``poll_blend_lookup``. The caller must call
             ``finish_request`` on completion, cancellation, or RPC failure.
+            Its independent server session permits reuse of a finished engine
+            request ID while the previous session is still retiring.
 
         Raises:
             NotImplementedError: Parallel or non-full-MHA cache geometry.
             RuntimeError: Duplicate request or server without protocol v2.
             TimeoutError: Protocol handshake exceeds the operation timeout.
         """
-        if request_id in self._lookups:
-            raise RuntimeError(f"LMCache lookup already exists for {request_id}")
+        if request_id in self._lookups or request_id in self._active_sessions:
+            raise RuntimeError(f"LMCache request already exists for {request_id}")
         self._ensure_blend_protocol()
         self._ensure_heartbeat_started()
         operation = LMCacheBlendLookupOperation(
             request_id=request_id,
+            session_id=f"{request_id}:{uuid.uuid4().hex}",
             token_ids=list(token_ids),
             local_hit_tokens=local_hit_tokens,
             cache_salt=cache_salt,
@@ -1256,14 +1264,35 @@ class UnifiedLMCacheMPConnector:
         device_indices_start: int,
         cache_salt: str,
     ) -> Optional[LMCacheStoreOperation]:
+        """Store an aligned suffix in the request's lookup session.
+
+        Args:
+            request_id: Engine request identifier. For CacheBlend, submit the
+                lookup before any stores and finish the request after transfers.
+            token_ids: Complete token IDs through the suffix to store.
+            device_indices: KV slots, either one tensor or one per engine group.
+            device_indices_start: Chunk-aligned token offset of the slot tables.
+            cache_salt: Namespace used by the corresponding lookup.
+
+        Returns:
+            Store operation, or None when no complete suffix can be submitted.
+
+        Raises:
+            ValueError: Slot tables do not cover the aligned store range.
+        """
         self._ensure_heartbeat_started()
 
         aligned_end = len(token_ids) // self.chunk_size * self.chunk_size
         start = self.get_store_start(request_id, aligned_end)
         if aligned_end <= start:
             return None
+        existing_lookup = self._lookups.get(request_id)
         lookup = LMCacheLookupOperation(
-            request_id=request_id,
+            request_id=(
+                existing_lookup.session_id
+                if isinstance(existing_lookup, LMCacheBlendLookupOperation)
+                else request_id
+            ),
             token_ids=list(token_ids),
             local_hit_tokens=0,
             cache_salt=cache_salt,
@@ -1513,6 +1542,7 @@ class UnifiedLMCacheMPConnector:
     def _retire_blend_lookup(
         self, operation: LMCacheBlendLookupOperation
     ) -> MessagingFuture[None]:
+        """Drain RPCs and end only this operation's server session."""
         # The operation is retired on the scheduler thread. Callbacks own only
         # this snapshot, never the connector's scheduler bookkeeping.
         completion: MessagingFuture[None] = MessagingFuture()
@@ -1555,7 +1585,7 @@ class UnifiedLMCacheMPConnector:
                 releases.popleft().add_done_callback(on_release)
                 return
             try:
-                self._req_client.end_session(operation.request_id).add_done_callback(
+                self._req_client.end_session(operation.session_id).add_done_callback(
                     on_end
                 )
             except Exception as exc:

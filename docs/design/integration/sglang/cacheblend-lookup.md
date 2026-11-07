@@ -31,6 +31,14 @@ Completed results remain on the operation, so repeated client polls do not
 start another server lookup. Retired operations cannot be polled. Empty aligned
 prompts submit no lookup and need no session-ending RPC.
 
+Each blend operation has a unique server `session_id`; `request_id` continues
+to identify the engine request. Lookup, prefix and sparse retrieves, explicit
+lock releases, stores, and END_SESSION use that same server identity. An engine
+ID reused after `finish_request` gets a new session, so delayed cleanup cannot
+remove the replacement's state. No history of retired IDs or scheduler wait is
+needed. Submit the blend lookup before any stores, including for short prompts
+whose initial lookup submits no RPC; a later store uses that operation's session.
+
 Server teardown disposes pending prefetch results and releases the prefix
 reservations of unfinished lookups. Client retirement waits asynchronously for
 the last lookup RPC before sending END_SESSION, so a late lookup cannot create
