@@ -6,8 +6,11 @@ wave slotting, and the fallback gates (non-lazy objects, compressed groups).
 Moved from test_blend_load_store_opts.py in the blend package split."""
 
 # Standard
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+import time
 
 # Third Party
 import pytest
@@ -16,8 +19,10 @@ import pytest
 from lmcache import device_ops  # noqa: F401
 from lmcache.v1.distributed.api import (
     DEFAULT_SHARD_REPLICATION_DESC,
+    PrefetchResult,
     ShardReplicationDesc,
 )
+from lmcache.v1.multiprocess.custom_types import CBMatchResult, IPCCacheServerKey
 from lmcache.v1.multiprocess.modules.blend import retrieve as retrieve_mod
 from lmcache.v1.multiprocess.modules.blend.module import BlendModule
 from lmcache.v1.multiprocess.modules.blend.rope import _CBRopeState
@@ -609,10 +614,9 @@ class _LockCountingStorageManager:
         self.locks: dict = {}
 
     def submit_prefetch_task(self, spec, external_request_id=None):
-        if spec.fetching_policy == "full":
-            for row in spec.key_groups:
-                for key in row.keys:
-                    self.locks[key] = self.locks.get(key, 0) + row.num_kv_readers
+        for row in spec.key_groups:
+            for key in row.keys:
+                self.locks[key] = self.locks.get(key, 0) + row.num_kv_readers
         handle = MagicMock()
         handle.key_groups = list(spec.key_groups)
         handle.total_requested_keys = 0
@@ -632,6 +636,7 @@ class _LockCountingStorageManager:
             hit_cells=rows(),
             l1_hit_cells=[Bitmap(len(row.keys)) for row in handle.key_groups],
             l2_hit_cells=rows(),
+            l1_owners={key: 0 for row in handle.key_groups for key in row.keys},
         )
 
     def finish_read_prefetched(self, keys, read_locks: int = 1, l1_owners=None) -> None:
@@ -732,6 +737,141 @@ def _run_unretrieved_lookup(blend, request_id: str, tp_replicas: int = 1):
     assert result.prefix_coverage_tokens == 0
     assert len(result.non_prefix_segments) == _UNRETRIEVED_N_CHUNKS
     return key
+
+
+@pytest.mark.parametrize("expired", [False, True])
+def test_ended_session_retires_pending_blend_lookup(expired: bool) -> None:
+    """An abandoned prefix prefetch is discarded without another client poll."""
+    storage = _LockCountingStorageManager()
+    ctx = _unretrieved_ctx(storage, ttl=0.0 if expired else _UNRETRIEVED_TTL_NEVER)
+    ctx.token_hasher.compute_packed_chunk_hashes.return_value = [b"prefix"]
+    blend = _unretrieved_blend(ctx)
+    key = IPCCacheServerKey.from_token_ids(
+        model_name="m",
+        world_size=1,
+        worker_id=None,
+        token_ids=list(range(_UNRETRIEVED_CHUNK)),
+        start=0,
+        end=_UNRETRIEVED_CHUNK,
+        request_id="cancel-pending",
+    )
+    try:
+        with (
+            patch.object(storage, "query_prefetch_status", return_value=None),
+            patch.object(storage, "discard_prefetch_task", create=True) as discard,
+        ):
+            assert blend.cb_unified_lookup(key, 1) is None
+            assert blend.report_status()["active_cb_lookups"] == 1
+            if expired:
+                assert ctx.session_manager.cleanup_expired() == 1
+            else:
+                ctx.session_manager.remove(key.request_id)
+            assert blend.report_status()["active_cb_lookups"] == 0
+            assert ctx.session_manager.active_count() == 0
+            discard.assert_called_once()
+    finally:
+        blend.close()
+        ctx.session_manager.close()
+
+
+def test_cancel_pending_sparse_releases_completed_prefix() -> None:
+    """Completed prefix locks and pending sparse results have distinct owners."""
+    storage = _LockCountingStorageManager()
+    ctx = _unretrieved_ctx(storage)
+    ctx.token_hasher.compute_packed_chunk_hashes.return_value = [b"prefix"]
+    with patch(
+        "lmcache.v1.multiprocess.modules.blend.module.BlendTokenRangeMatcher"
+    ) as matcher:
+        matcher.return_value.match_sub_sequence.return_value = [
+            CBMatchResult(0, 256, 256, 512, b"sparse")
+        ]
+        blend = _unretrieved_blend(ctx)
+    key = IPCCacheServerKey.from_token_ids(
+        model_name="m",
+        world_size=1,
+        worker_id=None,
+        token_ids=list(range(512)),
+        start=0,
+        end=512,
+        request_id="cancel-sparse",
+    )
+    query = storage.query_prefetch_status
+
+    def poll(handle: MagicMock) -> PrefetchResult | None:
+        return (
+            query(handle)
+            if handle.key_groups[0].keys[0].chunk_hash == b"prefix"
+            else None
+        )
+
+    try:
+        with (
+            patch.object(storage, "query_prefetch_status", side_effect=poll),
+            patch.object(storage, "discard_prefetch_task", create=True) as discard,
+        ):
+            assert blend.cb_unified_lookup(key, 1) is None
+            assert storage.outstanding() == 2
+            ctx.session_manager.remove(key.request_id)
+            assert blend.report_status()["active_cb_lookups"] == 0
+            assert storage.outstanding() == 1
+            assert all(key.chunk_hash == b"sparse" for key in storage.locks)
+            discard.assert_called_once()
+            assert (
+                discard.call_args.args[0].key_groups[0].keys[0].chunk_hash == b"sparse"
+            )
+    finally:
+        blend.close()
+        ctx.session_manager.close()
+
+
+def test_cancel_serializes_with_lookup_completion() -> None:
+    """A completing poll cannot recreate the session removed during that poll."""
+    storage = _LockCountingStorageManager()
+    ctx = _unretrieved_ctx(storage)
+    ctx.token_hasher.compute_packed_chunk_hashes.return_value = [b"prefix"]
+    blend = _unretrieved_blend(ctx)
+    entered, resume = Event(), Event()
+    query = storage.query_prefetch_status
+    key = IPCCacheServerKey.from_token_ids(
+        model_name="m",
+        world_size=1,
+        worker_id=None,
+        token_ids=list(range(256)),
+        start=0,
+        end=256,
+        request_id="cancel-racing",
+    )
+
+    def blocked_poll(handle: MagicMock) -> PrefetchResult:
+        entered.set()
+        assert resume.wait(10)
+        return query(handle)
+
+    try:
+        with (
+            ThreadPoolExecutor(max_workers=2) as executor,
+            patch.object(storage, "query_prefetch_status", side_effect=blocked_poll),
+            patch.object(storage, "discard_prefetch_task", create=True) as discard,
+        ):
+            try:
+                lookup = executor.submit(blend.cb_unified_lookup, key, 1)
+                assert entered.wait(5)
+                end = executor.submit(ctx.session_manager.remove, key.request_id)
+                deadline = time.monotonic() + 5
+                while blend.report_status()["active_cb_lookups"]:
+                    assert time.monotonic() < deadline
+                    time.sleep(0.001)
+                resume.set()
+                assert lookup.result(timeout=5) is not None
+                assert end.result(timeout=5) is not None
+                assert ctx.session_manager.active_count() == 0
+                assert storage.outstanding() == 0
+                discard.assert_not_called()
+            finally:
+                resume.set()
+    finally:
+        blend.close()
+        ctx.session_manager.close()
 
 
 def test_session_end_releases_unretrieved_sparse_locks():
@@ -944,6 +1084,7 @@ def test_sparse_classify_partial_column_releases_and_takes_no_strike(l1_owners):
         per_hash_obj_keys,
         hash_to_col,
         l1_owners=l1_owners,
+        session=MagicMock(),
     )
 
     assert [r.hash for r in found] == [b"whole"]
@@ -970,7 +1111,14 @@ def test_sparse_classify_fully_missing_chunk_still_strikes():
     empty_rows = [Bitmap(1), Bitmap(1)]
 
     assert (
-        eng._sparse_classify(key, matches, empty_rows, per_hash_obj_keys, hash_to_col)
+        eng._sparse_classify(
+            key,
+            matches,
+            empty_rows,
+            per_hash_obj_keys,
+            hash_to_col,
+            session=MagicMock(),
+        )
         == []
     )
     assert eng._stale_strike == {b"gone": 1}
@@ -978,7 +1126,14 @@ def test_sparse_classify_fully_missing_chunk_still_strikes():
     eng._ctx.storage_manager.finish_read_prefetched.assert_not_called()
 
     assert (
-        eng._sparse_classify(key, matches, empty_rows, per_hash_obj_keys, hash_to_col)
+        eng._sparse_classify(
+            key,
+            matches,
+            empty_rows,
+            per_hash_obj_keys,
+            hash_to_col,
+            session=MagicMock(),
+        )
         == []
     )
     eng._token_range_matcher.remove_chunks.assert_called_once_with([b"gone"])
@@ -1008,7 +1163,13 @@ def test_sparse_classify_unstaged_but_found_chunk_takes_no_strike():
     avail1.set(0)
 
     found = eng._sparse_classify(
-        key, matches, landed_rows, per_hash_obj_keys, hash_to_col, [avail0, avail1]
+        key,
+        matches,
+        landed_rows,
+        per_hash_obj_keys,
+        hash_to_col,
+        [avail0, avail1],
+        session=MagicMock(),
     )
 
     assert found == []

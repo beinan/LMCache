@@ -292,12 +292,21 @@ class BlendModule(
         return [P[i] for i in perm] if perm else []
 
     def _release_unretrieved_locks(self, session: Session) -> None:
-        """Release read locks the request's retrieve never consumed.
+        """Retire abandoned lookup jobs and release unconsumed reservations.
 
-        Without this, a request that never sends CB_RETRIEVE_PRE_COMPUTED
-        would pin its sparse-prefetched chunks in L1 forever. Session
-        destruction is the safe release point: no retrieve can arrive after.
+        Pending prefetch results transfer cleanup ownership to the storage
+        manager; no session callback waits for I/O. Session destruction is
+        the safe release point: the client must stop lookup/retrieve RPCs.
         """
+        with self._cb_jobs_lock:
+            job = self._cb_jobs.get(session.request_id)
+            if job is not None and job.session is session:
+                self._cb_jobs.pop(session.request_id)
+            else:
+                job = None
+        if job is not None:
+            with job.lock:
+                self._discard_lookup_job(job)
         stash = session.extras.pop(self.UNRETRIEVED_KEYS_EXTRA, None)
         if not stash:
             return
@@ -325,3 +334,18 @@ class BlendModule(
         hook); the GPU cache context is owned by LMCacheDrivenTransferModule."""
         if self._cb_rope_state.pop(instance_id, None) is not None:
             logger.info("Dropped CB rope state for reaped instance %d", instance_id)
+
+    def _discard_lookup_job(self, job: _CBUnifiedJob) -> None:
+        """Dispose a retired job's reservations while holding its lock."""
+        session = job.session
+        if job.prefix_handle is not None:
+            if job.prefix_chunks is None:
+                self._ctx.storage_manager.discard_prefetch_task(job.prefix_handle)
+            else:
+                owners = session.get_prefetch_owners()
+                if owners and session.lookup_ipc_key is not None:
+                    finish_lookup_read(
+                        self._ctx, session.lookup_ipc_key, list(owners), owners
+                    )
+        if job.handle is not None and job.found_rows is None:
+            self._ctx.storage_manager.discard_prefetch_task(job.handle)
