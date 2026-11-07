@@ -45,6 +45,15 @@ change requires a **new operation name**, never a changed existing contract.
 | `CB_REORDER_PLAN` | `(key, keep_prefix, budget_ms)` → `list[int]` | opt-in (`--enable-blend-reorder`, no coordinator); best-effort: `[]` = keep the prompt (off, no gain, out of budget, any error); else `key.token_ids` reordered, first `keep_prefix` tokens in place; the server never changes a request |
 | `CB_PROTOCOL_HANDSHAKE` | `(client_version)` → `(server_version, compatible)` | client-gated by `cb.handshake`, default off |
 
+`client_version` is the minimum blend protocol version the client requires.
+Version 2 honors `KernelGroupInfo.rope_num_layers`: only the leading declared
+components are re-RoPEd, while all components are scattered. Version 1 clients
+remain compatible; an omitted count keeps the legacy rotation behavior.
+Clients relying on explicit K/V component roles must request version 2 and
+check compatibility before issuing blend retrievals, because a version 1
+server can ignore the added registration metadata. This handshake does not
+change ordinary prefix-cache retrieval.
+
 `STORE` is shadowed: the blend module registers last, so its `store` wraps
 `LMCacheDrivenTransfer.store` with fingerprint registration.
 
