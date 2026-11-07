@@ -49,13 +49,14 @@ from lmcache.v1.multiprocess.token_codec import unpack_token_ids
 
 logger = init_logger(__name__)
 
-_BLEND_PROTOCOL_VERSION = 1
+# Version 2 consumes the per-kernel-group rotary component count.
+_BLEND_PROTOCOL_VERSION = 2
 
 
 def _handshake_response(client_version: int) -> tuple[int, bool]:
     return (
         _BLEND_PROTOCOL_VERSION,
-        client_version == _BLEND_PROTOCOL_VERSION,
+        1 <= client_version <= _BLEND_PROTOCOL_VERSION,
     )
 
 
@@ -228,6 +229,16 @@ class BlendModule(
 
     @request_handler()
     def cb_protocol_handshake(self, client_version: int) -> tuple[int, bool]:
+        """Report support for a client's required blend protocol version.
+
+        Args:
+            client_version: Minimum protocol version required by the client.
+                Version 2 requires registered rotary component limits;
+                version 1 clients retain the legacy behavior.
+
+        Returns:
+            Server version and whether the requested version is supported.
+        """
         return _handshake_response(client_version)
 
     def report_status(self) -> dict:

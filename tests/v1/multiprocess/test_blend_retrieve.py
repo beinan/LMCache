@@ -683,6 +683,18 @@ def _unretrieved_blend(ctx: MagicMock):
     return BlendModule(ctx, lmcache_driven_transfer=MagicMock())
 
 
+def test_blend_handshake_preserves_legacy_clients() -> None:
+    """Rotary-component support accepts v1 clients and rejects unknown versions."""
+    ctx = _unretrieved_ctx(_LockCountingStorageManager())
+    blend = _unretrieved_blend(ctx)
+    try:
+        for version, supported in ((1, True), (2, True), (0, False), (3, False)):
+            assert blend.cb_protocol_handshake(version) == (2, supported)
+    finally:
+        blend.close()
+        ctx.session_manager.close()
+
+
 def _run_unretrieved_lookup(blend, request_id: str, tp_replicas: int = 1):
     """Register ``_UNRETRIEVED_N_CHUNKS`` fingerprints and run a lookup that
     finds them all shifted (prefix coverage 0), i.e. the sparse leg locks
