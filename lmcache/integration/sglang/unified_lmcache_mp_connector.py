@@ -730,6 +730,10 @@ class UnifiedLMCacheMPConnector:
             The complete match result, or None while prefetch is pending.
             Repeated calls after completion return the same result.
 
+        Notes:
+            Only contiguous prefix coverage advances the request's store cursor;
+            sparse and segmented matches do not establish a stored prefix.
+
         Raises:
             RuntimeError: The request has ended or the operation was replaced.
             Exception: RPC failure; the caller must finish the request.
@@ -760,6 +764,13 @@ class UnifiedLMCacheMPConnector:
             operation.blend_result = result
             operation.total_hit_tokens = result.prefix_coverage_tokens
             operation.locks_held = result.prefix_coverage_tokens > 0
+            previous_store_end = self._store_submitted_tokens.get(
+                operation.request_id, 0
+            )
+            if result.prefix_coverage_tokens > previous_store_end:
+                self._store_submitted_tokens[operation.request_id] = (
+                    result.prefix_coverage_tokens
+                )
         return result
 
     def register_blend_rope(

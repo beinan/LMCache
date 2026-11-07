@@ -63,6 +63,7 @@ class TestSGLangBlendLookup(unittest.TestCase):
         self.assertIs(self.connector.poll_blend_lookup(operation), result)
         self.assertEqual(operation.total_hit_tokens, 0)
         self.assertEqual(self.connector.poll_lookup(operation), 0)
+        self.assertEqual(self.connector.get_store_start("sparse", 16), 0)
         self.assertIs(self.connector.poll_blend_lookup(operation), result)
         self.assertEqual(self.client.cb_unified_lookup.call_count, 2)
         key = self.client.cb_unified_lookup.call_args.args[0]
@@ -89,10 +90,29 @@ class TestSGLangBlendLookup(unittest.TestCase):
         self.connector.free_lookup_locks("mixed", 0, 8)
         self.assertIs(self.connector.poll_blend_lookup(operation), result)
         self.assertEqual(operation.total_hit_tokens, 8)
+        self.assertEqual(self.connector.get_store_start("mixed", 32), 8)
         self.connector.finish_request("mixed")
         self.client.end_session.assert_called_once_with(
             self.client.cb_unified_lookup.call_args.args[0].request_id
         )
+
+    def test_fully_cached_blend_prefix_needs_no_store(self) -> None:
+        self.future.set_result(CBUnifiedLookupResult(16, []))
+        operation = self.connector.submit_blend_lookup(
+            "cached", list(range(16)), local_hit_tokens=0, cache_salt=""
+        )
+        self.assertEqual(self.connector.poll_lookup(operation), 16)
+        self.assertIsNone(
+            self.connector.submit_store(
+                "cached",
+                list(range(16)),
+                torch.arange(8, 24),
+                device_indices_start=0,
+                cache_salt="",
+            )
+        )
+        self.transfer.submit_store.assert_not_called()
+        self.connector.finish_request("cached")
 
     def test_cancellation_waits_for_lookup_reply_without_resubmitting(self) -> None:
         operation = self.connector.submit_blend_lookup(
