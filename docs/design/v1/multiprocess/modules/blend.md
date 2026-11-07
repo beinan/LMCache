@@ -46,13 +46,18 @@ change requires a **new operation name**, never a changed existing contract.
 | `CB_PROTOCOL_HANDSHAKE` | `(client_version)` → `(server_version, compatible)` | client-gated by `cb.handshake`, default off |
 
 `client_version` is the minimum blend protocol version the client requires.
-Version 2 honors `KernelGroupInfo.rope_num_layers`: only the leading declared
-components are re-RoPEd, while all components are scattered. Version 1 clients
-remain compatible; an omitted count keeps the legacy rotation behavior.
-Clients relying on explicit K/V component roles must request version 2 and
-check compatibility before issuing blend retrievals, because a version 1
-server can ignore the added registration metadata. This handshake does not
-change ordinary prefix-cache retrieval.
+Rotary component support is advertised independently as `blend_rotary_components`
+through `GET_EXPERIMENTAL`, only when the blend module is enabled. It means
+`KernelGroupInfo.rope_num_layers` limits rotation to the leading declared
+components while all components are scattered. An omitted count keeps the
+legacy rotation behavior.
+
+Clients relying on explicit K/V roles must check this feature before registering
+RoPE or issuing blend lookups. A server may support a newer base protocol without
+honoring rotary metadata; the version alone is insufficient. For example,
+`(2, True)` without `blend_rotary_components` must be rejected by such a client.
+The capability does not imply chunked retrieve support and does not change
+ordinary prefix-cache retrieval.
 
 `STORE` is shadowed: the blend module registers last, so its `store` wraps
 `LMCacheDrivenTransfer.store` with fingerprint registration.

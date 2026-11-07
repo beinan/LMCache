@@ -12,7 +12,10 @@ import weakref
 # First Party
 from lmcache.logging import init_logger
 from lmcache.v1.mp_coordinator.blend_client import BlendCoordinatorClient
-from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
+from lmcache.v1.multiprocess.custom_types import (
+    BLEND_ROTARY_COMPONENTS,
+    IPCCacheServerKey,
+)
 from lmcache.v1.multiprocess.engine_context import (
     MPCacheServerContext,
     finish_lookup_read,
@@ -49,8 +52,7 @@ from lmcache.v1.multiprocess.token_codec import unpack_token_ids
 
 logger = init_logger(__name__)
 
-# Version 2 consumes the per-kernel-group rotary component count.
-_BLEND_PROTOCOL_VERSION = 2
+_BLEND_PROTOCOL_VERSION = 1
 
 
 def _handshake_response(client_version: int) -> tuple[int, bool]:
@@ -105,7 +107,7 @@ class BlendModule(
             match_concurrency=coordinator_config.blend_match_concurrency,
         )
         transfer_module = build_ctx.require(LMCacheDrivenTransferModule)
-        return cls(
+        module = cls(
             build_ctx.engine_context,
             transfer_module,
             coordinator=coordinator,
@@ -113,6 +115,8 @@ class BlendModule(
             enable_dedup_content=build_ctx.mp_config.enable_dedup_content,
             enable_reorder=build_ctx.mp_config.enable_blend_reorder,
         )
+        build_ctx.add_experimental(BLEND_ROTARY_COMPONENTS)
+        return module
 
     #: ``Session.extras`` key: ``{"key": lookup key, "per_hash": {hash: keys}}``
     #: — the sparse lookup's read-lock reservation, consumed by exactly one
@@ -233,8 +237,8 @@ class BlendModule(
 
         Args:
             client_version: Minimum protocol version required by the client.
-                Version 2 requires registered rotary component limits;
-                version 1 clients retain the legacy behavior.
+                Rotary component support is advertised separately through
+                ``get_experimental`` as ``blend_rotary_components``.
 
         Returns:
             Server version and whether the requested version is supported.

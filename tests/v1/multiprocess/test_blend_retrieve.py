@@ -689,12 +689,12 @@ def _unretrieved_blend(ctx: MagicMock):
 
 
 def test_blend_handshake_preserves_legacy_clients() -> None:
-    """Rotary-component support accepts v1 clients and rejects unknown versions."""
+    """Rotary support does not claim a newer base protocol contract."""
     ctx = _unretrieved_ctx(_LockCountingStorageManager())
     blend = _unretrieved_blend(ctx)
     try:
-        for version, supported in ((1, True), (2, True), (0, False), (3, False)):
-            assert blend.cb_protocol_handshake(version) == (2, supported)
+        for version, supported in ((1, True), (2, False), (0, False), (3, False)):
+            assert blend.cb_protocol_handshake(version) == (1, supported)
     finally:
         blend.close()
         ctx.session_manager.close()

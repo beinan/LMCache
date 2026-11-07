@@ -699,6 +699,7 @@ def test_blend_factory_gating(
         with pytest.raises(ValueError, match="blend engine requires"):
             BlendModule.create(build_ctx)
     constructor.assert_not_called()
+    assert build_ctx.experimental == []
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -727,6 +728,7 @@ def test_blend_factory_forwards_configuration(
     build_ctx.register(LMCacheDrivenTransferModule, transfer)
 
     assert isinstance(BlendModule.create(build_ctx), BlendModule)
+    assert build_ctx.experimental == ["blend_rotary_components"]
 
     constructor.assert_called_once_with(
         context,
@@ -774,6 +776,9 @@ def test_blend_store_overrides_transfer_handler(
         server.start()
         client = RequestClientFactory.create(url)
         try:
+            assert "blend_rotary_components" in client.get_experimental().result(
+                timeout=5
+            )
             assert client.store(key, 1, [[0]], b"").result(timeout=5) == (
                 b"BlendModule",
                 True,

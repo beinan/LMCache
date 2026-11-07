@@ -3,7 +3,10 @@
 The explicit `submit_blend_lookup` / `poll_blend_lookup` API prepares matches
 for selective prefill. It is not enabled by the existing unified radix-cache
 scheduler. It currently accepts single-rank full MHA registrations and requires
-server protocol v2, which supports separate rotary and value components.
+a compatible base blend protocol plus the `blend_rotary_components` feature
+from `GET_EXPERIMENTAL`. The feature confirms separate rotary and value
+components; a newer protocol version alone does not. Both checks run before
+RoPE registration or the first blend lookup.
 
 ## Ownership and prefix semantics
 

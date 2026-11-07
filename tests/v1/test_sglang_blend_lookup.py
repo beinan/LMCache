@@ -26,7 +26,10 @@ class TestSGLangBlendLookup(unittest.TestCase):
     def setUp(self) -> None:
         self.client = Mock()
         self.client.get_chunk_size.return_value.result.return_value = 8
-        self.client.cb_protocol_handshake.return_value.result.return_value = (2, True)
+        self.client.cb_protocol_handshake.return_value.result.return_value = (1, True)
+        self.client.get_experimental.return_value.result.return_value = [
+            "blend_rotary_components"
+        ]
         self.future: MessagingFuture[CBUnifiedLookupResult | None] = MessagingFuture()
         self.client.cb_unified_lookup.return_value = self.future
         self.release: MessagingFuture[None] = MessagingFuture()
@@ -370,15 +373,44 @@ class TestSGLangBlendLookup(unittest.TestCase):
             self.client.cb_unified_lookup.call_args.args[0].request_id
         )
 
-    def test_old_server_rejected_before_lookup(self) -> None:
-        self.client.cb_protocol_handshake.return_value.result.return_value = (1, True)
-        with self.assertRaisesRegex(RuntimeError, "protocol v2"):
+    def test_server_without_rotary_capability_rejected_before_lookup(self) -> None:
+        self.future.set_result(CBUnifiedLookupResult(0, []))
+        self.client.get_experimental.return_value.result.return_value = []
+        for version in (1, 2):
+            with self.subTest(version=version):
+                self.client.cb_protocol_handshake.return_value.result.return_value = (
+                    version,
+                    True,
+                )
+                with self.assertRaisesRegex(RuntimeError, "blend_rotary_components"):
+                    self.connector.submit_blend_lookup(
+                        "old", list(range(16)), local_hit_tokens=0, cache_salt=""
+                    )
+                self.client.cb_unified_lookup.assert_not_called()
+                with self.assertRaisesRegex(RuntimeError, "blend_rotary_components"):
+                    self.connector.register_blend_rope(None, is_neox_style=False)
+                self.transfer.register_blend_rope.assert_not_called()
+                self.connector.finish_request("old")
+                self.client.end_session.assert_not_called()
+
+    def test_newer_protocol_with_rotary_capability_is_accepted(self) -> None:
+        self.client.cb_protocol_handshake.return_value.result.return_value = (2, True)
+        result = CBUnifiedLookupResult(0, [])
+        self.future.set_result(result)
+        operation = self.connector.submit_blend_lookup(
+            "newer", list(range(16)), local_hit_tokens=0, cache_salt=""
+        )
+        self.assertIs(self.connector.poll_blend_lookup(operation), result)
+        self.connector.finish_request("newer")
+
+    def test_incompatible_protocol_rejected_before_feature_query(self) -> None:
+        self.client.cb_protocol_handshake.return_value.result.return_value = (1, False)
+        with self.assertRaisesRegex(RuntimeError, "protocol"):
             self.connector.submit_blend_lookup(
-                "old", list(range(16)), local_hit_tokens=0, cache_salt=""
+                "incompatible", list(range(16)), local_hit_tokens=0, cache_salt=""
             )
+        self.client.get_experimental.assert_not_called()
         self.client.cb_unified_lookup.assert_not_called()
-        self.connector.finish_request("old")
-        self.client.end_session.assert_not_called()
 
     def test_short_prompt_never_creates_server_session(self) -> None:
         operation = self.connector.submit_blend_lookup(

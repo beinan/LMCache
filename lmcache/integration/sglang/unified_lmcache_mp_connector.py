@@ -30,7 +30,11 @@ from lmcache.integration.sglang.lmcache_mp_metadata import (
     LMCacheStoreOperation,
     SGLangKVComponentGroup,
 )
-from lmcache.v1.multiprocess.custom_types import CBMatchResult, CBUnifiedLookupResult
+from lmcache.v1.multiprocess.custom_types import (
+    BLEND_ROTARY_COMPONENTS,
+    CBMatchResult,
+    CBUnifiedLookupResult,
+)
 from lmcache.v1.multiprocess.futures import MessagingFuture
 
 if TYPE_CHECKING:
@@ -679,8 +683,9 @@ class UnifiedLMCacheMPConnector:
 
         Raises:
             NotImplementedError: Parallel or non-full-MHA cache geometry.
-            RuntimeError: Duplicate request or server without protocol v2.
-            TimeoutError: Protocol handshake exceeds the operation timeout.
+            RuntimeError: Duplicate request, incompatible protocol, or server
+                without rotary component support.
+            TimeoutError: Protocol or capability query exceeds the RPC timeout.
         """
         if request_id in self._lookups or request_id in self._active_sessions:
             raise RuntimeError(f"LMCache request already exists for {request_id}")
@@ -770,8 +775,9 @@ class UnifiedLMCacheMPConnector:
         Raises:
             ValueError: Invalid table geometry or device.
             NotImplementedError: Unsupported layout or transfer context.
-            RuntimeError: KV registration is absent or protocol v2 unavailable.
-            TimeoutError: Registration or handshake exceeds the RPC timeout.
+            RuntimeError: KV registration is absent, protocol is incompatible,
+                or the server lacks rotary component support.
+            TimeoutError: Registration, protocol, or capability query times out.
 
         Call during model initialization, before submitting blend retrieves.
         Models with distinct per-layer rotary tables need separate registration
@@ -1646,9 +1652,17 @@ class UnifiedLMCacheMPConnector:
         ):
             raise NotImplementedError("CacheBlend requires single-rank full MHA")
         if not self._blend_protocol_ready:
-            version, compatible = self._req_client.cb_protocol_handshake(2).result(
+            version, compatible = self._req_client.cb_protocol_handshake(1).result(
                 timeout=self._mq_timeout
             )
-            if version < 2 or not compatible:
-                raise RuntimeError("SGLang CacheBlend requires server protocol v2")
+            if version < 1 or not compatible:
+                raise RuntimeError("SGLang CacheBlend requires a compatible protocol")
+            features = self._req_client.get_experimental().result(
+                timeout=self._mq_timeout
+            )
+            if BLEND_ROTARY_COMPONENTS not in features:
+                raise RuntimeError(
+                    "SGLang CacheBlend requires the server capability "
+                    f"{BLEND_ROTARY_COMPONENTS}"
+                )
             self._blend_protocol_ready = True

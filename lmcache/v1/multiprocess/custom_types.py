@@ -387,6 +387,8 @@ def get_customized_decoder(type: Any) -> msgspec.msgpack.Decoder:
 # server module (lmcache.v1.multiprocess.plugin_modules.qstore); the vLLM
 # connector requests it for ``lmcache.mp.transfer_intermediate_tensors``.
 TRANSFER_QUERY = "transfer_query"
+# Blend honors per-kernel-group rotary limits, keeping value components unchanged.
+BLEND_ROTARY_COMPONENTS = "blend_rotary_components"
 KV_EVENT_KIND_STORED = "stored"
 KV_EVENT_KIND_REMOVED = "removed"
 KV_EVENT_MEDIUM_CPU = "CPU"
