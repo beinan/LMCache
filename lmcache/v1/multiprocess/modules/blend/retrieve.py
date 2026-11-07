@@ -243,8 +243,15 @@ class RetrieveMixin:
                 slot_mapping_base=0,
                 slot_mapping_capacity=0,
                 is_neox=rope_state.is_neox_style,
+                rope_num_layers=(
+                    -1 if group.rope_num_layers is None else group.rope_num_layers
+                ),
             )
-            rot = rope_state.rot_for_group(group.engine_group_idx, buf0.dtype)
+            rot = (
+                None
+                if group.rope_num_layers == 0
+                else rope_state.rot_for_group(group.engine_group_idx, buf0.dtype)
+            )
             if rot is None or not rope_state.cos_sin_caches:
                 # Skipped group ([], quantized, or NoPE): staging + scatter
                 # only. cos_sin_cache == 0 disables native rope, so the dtype

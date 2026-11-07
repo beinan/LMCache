@@ -90,6 +90,7 @@ def _build_plan_engine_and_context(
             tokens_per_block=4,
             slots_per_block=4,
             engine_group_idx=0,
+            rope_num_layers=None,
             engine_kv_format=lmcache_native.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS,
             shape_desc=SimpleNamespace(nb=100),
         )
