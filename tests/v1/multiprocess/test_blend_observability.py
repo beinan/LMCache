@@ -544,3 +544,91 @@ class TestLookupOnlyRequestEnds:
 
         assert result.non_prefix_segments == [match]
         assert [e[0] for e in _published(eng)] == [EventType.CB_LOOKUP_END]
+
+
+@pytest.mark.parametrize("scenario", ["stale", "pending", "already_removed"])
+def test_lookup_eviction_events_count_removed_fingerprints(
+    monkeypatch: pytest.MonkeyPatch, scenario: str
+) -> None:
+    """First strikes and in-flight re-stores do not evict fingerprints."""
+    ctx = MagicMock()
+    ctx.chunk_size = 4
+    ctx.token_hasher = TokenHasher(chunk_size=4)
+    ctx.session_manager = SessionManager(ctx.token_hasher, cleanup_interval=None)
+    ctx.event_bus.has_subscribers.return_value = False
+    ctx.layout_desc_registry.find_group_layout_descs.return_value = {
+        0: MemoryLayoutDesc([torch.Size([4, 2])], [torch.bfloat16])
+    }
+    ctx.layout_desc_registry.find_attn_desc.return_value = AttnWindowDesc(
+        num_chunks_in_sw=[-1], world_size=1, group_kinds=("attention",)
+    )
+    ctx.layout_desc_registry.find_shard_replication_desc.return_value = (
+        DEFAULT_SHARD_REPLICATION_DESC
+    )
+    handle = PrefetchHandle(
+        prefetch_request_id=1,
+        external_request_id="test",
+        total_requested_keys=0,
+        submit_time=0,
+    )
+    ctx.storage_manager.query_prefetch_status.return_value = PrefetchResult(
+        hit_cells=[Bitmap(1)], l1_hit_cells=[Bitmap(1)], l2_hit_cells=[Bitmap(1)]
+    )
+    source = IPCCacheServerKey.from_token_ids(
+        "model", 1, 0, [1, 2, 3, 4], request_id="store", end=4
+    )
+    matcher = BlendTokenRangeMatcher(chunk_size=4)
+    matcher.on_new_token_hashes(
+        [1, 2, 3, 4], ctx.token_hasher.compute_packed_chunk_hashes(source.token_bytes)
+    )
+    monkeypatch.setattr(
+        "lmcache.v1.multiprocess.modules.blend.module.BlendTokenRangeMatcher",
+        MagicMock(return_value=matcher),
+    )
+    # Hold the device completion so a re-store stays in flight during lookup.
+    callbacks = MagicMock()
+    monkeypatch.setattr(
+        "lmcache.v1.multiprocess.modules.blend.store.submit_callback_to_stream",
+        callbacks,
+    )
+
+    def submit(spec: PrefetchTaskSpec, external_request_id: str) -> PrefetchHandle:
+        if (
+            scenario == "already_removed"
+            and external_request_id == "lookup-1"
+            and spec.fetching_policy == "full"
+        ):
+            matcher.remove_chunks(
+                ctx.token_hasher.compute_packed_chunk_hashes(source.token_bytes)
+            )
+        return handle
+
+    ctx.storage_manager.submit_prefetch_task.side_effect = submit
+    transfer = MagicMock()
+    transfer.store_with_chunk_mask.return_value = (b"done", True, [True])
+    blend = BlendModule(ctx, transfer)
+    try:
+        if scenario == "pending":
+            assert blend.store(source, 0, [[0]], b"ready") == (b"done", True)
+            callbacks.assert_called_once()
+        retained = []
+        evicted = []
+        for i in range(3):
+            query = IPCCacheServerKey.from_token_ids(
+                "model", 1, None, [99, 1, 2, 3, 4], request_id=f"lookup-{i}", end=5
+            )
+            result = blend.cb_unified_lookup(query, 1)
+            assert result is not None and not result.non_prefix_segments
+            retained.append(len(matcher.match_sub_sequence([1, 2, 3, 4])))
+            evicted.append(
+                sum(
+                    call.args[0].metadata["num_chunks"]
+                    for call in ctx.event_bus.publish.call_args_list
+                    if call.args[0].event_type is EventType.CB_CHUNKS_EVICTED
+                )
+            )
+        assert retained == ([1, 1, 1] if scenario == "pending" else [1, 0, 0])
+        assert evicted == ([0, 1, 1] if scenario == "stale" else [0, 0, 0])
+    finally:
+        blend.close()
+        ctx.session_manager.close()
