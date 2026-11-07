@@ -30,9 +30,13 @@ Completed results remain on the operation, so repeated client polls do not
 start another server lookup. Retired operations cannot be polled. Empty aligned
 prompts submit no lookup and need no session-ending RPC.
 
-Before enabling the scheduler caller, server cancellation must also drain
-pending prefetch handles and release their locks: END_SESSION currently cleans
-completed sparse reservations but leaves pending CacheBlend jobs behind.
-The client tests establish RPC and metadata ownership, not that server cleanup
-or selective generation is complete. Retrieval events, model execution, and
-TP/PP match distribution remain separate integration work.
+Server teardown disposes pending prefetch results and releases the prefix
+reservations of unfinished lookups. Before enabling the scheduler caller,
+client cancellation must still wait asynchronously for the last lookup RPC
+to settle before sending END_SESSION, and release completed prefix locks that
+no retrieve consumed. Otherwise END_SESSION can arrive before the first
+lookup handler creates its session.
+
+The client tests establish RPC and metadata ownership, not that selective
+generation is complete. Retrieval events, model execution, and TP/PP match
+distribution remain separate integration work.
