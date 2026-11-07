@@ -43,6 +43,7 @@ from lmcache.v1.multiprocess.modules.blend.read_set import (
     _classify_cb_read_groups,
 )
 from lmcache.v1.multiprocess.request_handler import HandlerType, request_handler
+from lmcache.v1.multiprocess.session import Session
 from lmcache.v1.multiprocess.token_codec import unpack_token_ids
 
 logger = init_logger(__name__)
@@ -60,10 +61,14 @@ class _CBUnifiedJob:
     """Per-request poll state for non-blocking cb_unified_lookup.
 
     Stashed across polls because the underlying status/found polls are
-    consume-once.
+    consume-once. The per-job lock guards advancement and cancellation;
+    retaining the original session prevents a late poll from recreating it.
     """
 
+    session: Session
     matches: list[CBMatchResult]
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    started: bool = False
     num_tokens: int = 0
     # Prefix leg (blend-module-owned submit/poll). ``prefix_handle`` is None when
     # there is no GPU context / no full chunk (poll reports 0 coverage).
@@ -228,6 +233,8 @@ class LookupMixin:
         hash_to_col: dict[bytes, int],
         avail_rows: list[Bitmap] | None = None,
         l1_owners: dict[ObjectKey, int] | None = None,
+        *,
+        session: Session,
     ) -> list[CBMatchResult]:
         """Classify each prefetched chunk: found (every key loaded),
         skipped (exists per ``avail_rows`` but not fully staged: no strike,
@@ -309,7 +316,6 @@ class LookupMixin:
                 for r in found_cb_match_result
                 if r.hash in per_hash_obj_keys
             }
-            session = self._ctx.session_manager.get_or_create(key.request_id)
             # A repeat lookup replaces the stash; release the superseded
             # reservation first or its locks leak.
             prev = session.extras.pop(self.UNRETRIEVED_KEYS_EXTRA, None)
@@ -333,6 +339,7 @@ class LookupMixin:
         self,
         key: IPCCacheServerKey,
         tp_size: int,
+        session: Session,
     ) -> _PrefixLegSubmit:
         """Submit the CB prefix prefetch (non-blocking).
 
@@ -341,7 +348,8 @@ class LookupMixin:
 
         Args:
             key: Request key (token IDs, request_id, model, world_size).
-            tp_size: Tensor-parallel size for MLA multi-reader locking.
+            tp_size: Legacy argument; locks use the registered shard layout.
+            session: Session owned by this lookup, retained through cancellation.
 
         Returns:
             ``(handle, prefix_gids, row_windows, n_chunks, no_gpu_context)``.
@@ -408,7 +416,6 @@ class LookupMixin:
             fetching_policy="prefix",
         )
         row_windows = tuple(row.sliding_window_size for row in spec.key_groups)
-        session = self._ctx.session_manager.get_or_create(rid)
         session.set_tokens(key.token_bytes)
         session.begin_lookup(key)
         handle = self._ctx.storage_manager.submit_prefetch_task(
@@ -424,7 +431,7 @@ class LookupMixin:
         )
 
     def _poll_prefix_leg(
-        self, job: "_CBUnifiedJob", rid: str, segmented: bool
+        self, job: "_CBUnifiedJob", rid: str, segmented: bool, session: Session
     ) -> "tuple[int, list[int] | None] | None":
         """Poll the CB prefix handle; on completion close the cb.prefix_lookup
         span (consume-once: CB_PREFIX_LOOKUP_END is published exactly once).
@@ -460,7 +467,6 @@ class LookupMixin:
             leading, retained = 0, ([] if segmented else None)
         # Publish the lock model so free_lookup_locks releases exactly what
         # this leg locked.
-        session = self._ctx.session_manager.get_or_create(rid)
         session.record_prefetch_result(leading, job.prefix_lock_gids, owners)
         self._event_bus.publish(
             Event(
@@ -477,23 +483,49 @@ class LookupMixin:
     ) -> CBUnifiedLookupResult | None:
         """Non-blocking single-RPC blend lookup (submit-once, poll-on-recall).
 
+        A per-job lock serializes polling with session destruction. The client
+        must stop submitting lookup RPCs before ending the session.
+
         First call submits the prefix lookup + fingerprint match; later calls
         poll, returning ``None`` until both legs are L1-resident (so a worker
         thread never blocks on the L2->L1 loads). The prefix job's L1 read
         locks persist for the retrieve.
+
+        Args:
+            key: Cache namespace, prompt tokens, and request identifier.
+            tp_size: Legacy argument; locks use the registered shard layout.
 
         Returns:
             ``None`` while either leg is still loading (the caller re-issues
             to poll); on completion, the prefix coverage in tokens plus the
             found non-prefix segments. A result with nothing to retrieve also
             ends the request here (no retrieve will follow).
+
+        Raises:
+            RuntimeError: The lookup retired while this poll waited for its lock.
         """
+        rid = key.request_id
+        with self._cb_jobs_lock:
+            job = self._cb_jobs.get(rid)
+            if job is None:
+                job = _CBUnifiedJob(
+                    session=self._ctx.session_manager.get_or_create(rid), matches=[]
+                )
+                self._cb_jobs[rid] = job
+        with job.lock:
+            with self._cb_jobs_lock:
+                if self._cb_jobs.get(rid) is not job:
+                    raise RuntimeError(f"CacheBlend lookup {rid} has been retired")
+            return self._poll_unified_lookup(key, tp_size, job)
+
+    def _poll_unified_lookup(
+        self, key: IPCCacheServerKey, tp_size: int, job: _CBUnifiedJob
+    ) -> CBUnifiedLookupResult | None:
+        """Advance a lookup while holding its per-request lock."""
         rid = key.request_id
         chunk_size = self._ctx.chunk_size
 
-        with self._cb_jobs_lock:
-            job = self._cb_jobs.get(rid)
-        if job is None:
+        if not job.started:
             # First invocation: start events + submit prefix + fingerprint match.
             self._event_bus.publish(
                 Event(event_type=EventType.CB_REQUEST_START, session_id=rid)
@@ -518,7 +550,13 @@ class LookupMixin:
                 prefix_windows,
                 prefix_n_chunks,
                 prefix_no_ctx,
-            ) = self._submit_prefix_leg(key, tp_size)
+            ) = self._submit_prefix_leg(key, tp_size, job.session)
+            job.num_tokens = key.num_tokens
+            job.prefix_handle = prefix_handle
+            job.prefix_lock_gids = prefix_gids
+            job.prefix_windows = prefix_windows
+            job.prefix_num_chunks = prefix_n_chunks
+            job.no_gpu_context = prefix_no_ctx
             # With a coordinator the fleet directory is the only match source;
             # skip the local matcher.
             matches: list[CBMatchResult]
@@ -539,15 +577,7 @@ class LookupMixin:
                         metadata={"matches": len(matches)},
                     )
                 )
-            job = _CBUnifiedJob(
-                matches=matches,
-                num_tokens=key.num_tokens,
-                prefix_handle=prefix_handle,
-                prefix_lock_gids=prefix_gids,
-                prefix_windows=prefix_windows,
-                prefix_num_chunks=prefix_n_chunks,
-                no_gpu_context=prefix_no_ctx,
-            )
+            job.matches = matches
             job.segmented = use_segmented
             job.coord_submitted = self._submit_coordinator_match(key)
             if job.coord_submitted and self._coordinator is not None:
@@ -560,15 +590,13 @@ class LookupMixin:
                         session_id=rid,
                     )
                 )
-            with self._cb_jobs_lock:
-                self._cb_jobs[rid] = job
+            job.started = True
 
-        assert job is not None
         segmented = job.segmented
 
         # --- Prefix leg: poll (consume-once) until the L1+L2 prefix lands. ---
         if job.prefix_chunks is None:
-            res = self._poll_prefix_leg(job, rid, segmented)
+            res = self._poll_prefix_leg(job, rid, segmented, job.session)
             if res is None:
                 return None  # prefix still loading -> defer
             job.prefix_chunks, prefix_retained = res
@@ -666,6 +694,7 @@ class LookupMixin:
                 job.hash_to_col or {},
                 job.avail_rows,
                 l1_owners=job.l1_owners,
+                session=job.session,
             )
             # Overlap dedup over the retrievable candidates; dropped
             # candidates' keys are released by the retrieve's orphan sweep.
@@ -737,7 +766,8 @@ class LookupMixin:
                 Event(event_type=EventType.CB_REQUEST_END, session_id=rid)
             )
         with self._cb_jobs_lock:
-            self._cb_jobs.pop(rid, None)
+            if self._cb_jobs.get(rid) is job:
+                self._cb_jobs.pop(rid)
         return CBUnifiedLookupResult(
             prefix_coverage_tokens=prefix_tokens,
             non_prefix_segments=found,
