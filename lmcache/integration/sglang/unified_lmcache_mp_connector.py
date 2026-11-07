@@ -23,11 +23,13 @@ import torch.distributed as dist
 
 # First Party
 from lmcache.integration.sglang.lmcache_mp_metadata import (
+    LMCacheBlendLookupOperation,
     LMCacheLoadOperation,
     LMCacheLookupOperation,
     LMCacheStoreOperation,
     SGLangKVComponentGroup,
 )
+from lmcache.v1.multiprocess.custom_types import CBUnifiedLookupResult
 
 if TYPE_CHECKING:
     # First Party
@@ -292,6 +294,7 @@ class UnifiedLMCacheMPConnector:
         ) = self._build_engine_group_info_specs()
         self._req_client = RequestClientFactory.create(self.server_url)
         self._transfer_ctx: Optional["TransferContext"] = None
+        self._blend_protocol_ready = False
         self._registered = False
         self._is_kv_writer = True
         self._closed = False
@@ -641,8 +644,129 @@ class UnifiedLMCacheMPConnector:
             operation.total_hit_tokens = 0
         return operation
 
+    def submit_blend_lookup(
+        self,
+        request_id: str,
+        token_ids: list[int],
+        *,
+        local_hit_tokens: int,
+        cache_salt: str,
+    ) -> LMCacheBlendLookupOperation:
+        """Start a request-owned CacheBlend lookup for single-rank full MHA.
+
+        Args:
+            request_id: Unique live request identifier.
+            token_ids: Complete prompt token IDs.
+            local_hit_tokens: Contiguous prefix already cached by SGLang.
+            cache_salt: Namespace used by the corresponding store.
+
+        Returns:
+            Operation to pass to ``poll_blend_lookup``. The caller must call
+            ``finish_request`` on completion, cancellation, or RPC failure.
+
+        Raises:
+            NotImplementedError: Parallel or non-full-MHA cache geometry.
+            RuntimeError: Duplicate request or server without protocol v2.
+            TimeoutError: Protocol handshake exceeds the operation timeout.
+        """
+        if (
+            self.kv_world_size != 1
+            or self.mla_enabled
+            or any(
+                group.recurrent_state
+                or group.sliding_window_size >= 0
+                or group.rope_num_layers is None
+                for group in self._kv_groups
+            )
+        ):
+            raise NotImplementedError("CacheBlend lookup requires single-rank full MHA")
+        if request_id in self._lookups:
+            raise RuntimeError(f"LMCache lookup already exists for {request_id}")
+        if not self._blend_protocol_ready:
+            version, compatible = self._req_client.cb_protocol_handshake(2).result(
+                timeout=self._mq_timeout
+            )
+            if version < 2 or not compatible:
+                raise RuntimeError("SGLang CacheBlend requires server protocol v2")
+            self._blend_protocol_ready = True
+        self._ensure_heartbeat_started()
+        operation = LMCacheBlendLookupOperation(
+            request_id=request_id,
+            token_ids=list(token_ids),
+            local_hit_tokens=local_hit_tokens,
+            cache_salt=cache_salt,
+        )
+        aligned_end = len(token_ids) // self.chunk_size * self.chunk_size
+        if aligned_end == 0:
+            operation.total_hit_tokens = 0
+            operation.blend_result = CBUnifiedLookupResult(0, [])
+        else:
+            key = self._create_key(
+                operation,
+                start=0,
+                end=aligned_end,
+                worker_id=None,
+                request_configs={
+                    "lmcache.hint.engine_computed_tokens": local_hit_tokens
+                },
+            )
+            operation.submission_future = self._req_client.cb_unified_lookup(key, 1)
+            self._active_sessions.add(request_id)
+        self._lookups[request_id] = operation
+        return operation
+
+    def poll_blend_lookup(
+        self, operation: LMCacheBlendLookupOperation
+    ) -> Optional[CBUnifiedLookupResult]:
+        """Poll sparse lookup without folding its spans into prefix coverage.
+
+        Args:
+            operation: Live operation returned by ``submit_blend_lookup``.
+
+        Returns:
+            The complete match result, or None while prefetch is pending.
+            Repeated calls after completion return the same result.
+
+        Raises:
+            RuntimeError: The request has ended or the operation was replaced.
+            Exception: RPC failure; the caller must finish the request.
+        """
+        if self._lookups.get(operation.request_id) is not operation:
+            raise RuntimeError("Cannot poll a retired CacheBlend lookup")
+        if operation.blend_result is not None:
+            return operation.blend_result
+        future = operation.submission_future
+        if future is None:
+            aligned_end = len(operation.token_ids) // self.chunk_size * self.chunk_size
+            key = self._create_key(
+                operation,
+                start=0,
+                end=aligned_end,
+                worker_id=None,
+                request_configs={
+                    "lmcache.hint.engine_computed_tokens": operation.local_hit_tokens
+                },
+            )
+            operation.submission_future = self._req_client.cb_unified_lookup(key, 1)
+            return None
+        if not future.query():
+            return None
+        result = future.result(timeout=0)
+        operation.submission_future = None
+        if result is not None:
+            operation.blend_result = result
+            operation.total_hit_tokens = result.prefix_coverage_tokens
+            operation.locks_held = result.prefix_coverage_tokens > 0
+        return result
+
     def poll_lookup(self, operation: LMCacheLookupOperation) -> Optional[int]:
-        """Return total hit tokens, or ``None`` while lookup+prefetch runs."""
+        """Return contiguous prefix coverage, or None while prefetch runs.
+
+        For blend operations, obtain sparse spans with ``poll_blend_lookup``.
+        """
+        if isinstance(operation, LMCacheBlendLookupOperation):
+            blend_result = self.poll_blend_lookup(operation)
+            return None if blend_result is None else blend_result.prefix_coverage_tokens
         if operation.total_hit_tokens is not None:
             return operation.total_hit_tokens
         result = -1
@@ -1138,8 +1262,11 @@ class UnifiedLMCacheMPConnector:
 
         A successful retrieve releases the locks it consumed from the LMCache
         server's H2D completion callback.  At that point only the local lookup
-        bookkeeping must be removed.
+        bookkeeping must be removed. Blend operations retain their sparse
+        metadata until the request ends.
         """
+        if isinstance(operation, LMCacheBlendLookupOperation):
+            return
         if self._lookups.get(operation.request_id) is operation:
             self._lookups.pop(operation.request_id, None)
 
@@ -1167,7 +1294,8 @@ class UnifiedLMCacheMPConnector:
         operation.lock_start = end
         if end == operation.total_hit_tokens:
             operation.locks_held = False
-            self._lookups.pop(request_id, None)
+            if not isinstance(operation, LMCacheBlendLookupOperation):
+                self._lookups.pop(request_id, None)
 
     def end_session(self, request_id: str) -> None:
         # A local lookup object can represent an aligned-empty lookup for

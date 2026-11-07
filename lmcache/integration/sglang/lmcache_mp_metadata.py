@@ -15,6 +15,9 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.radix_cache import RadixKey
     from sglang.srt.mem_cache.unified_radix_cache import NodeId
 
+    # First Party
+    from lmcache.v1.multiprocess.custom_types import CBUnifiedLookupResult
+
 
 @dataclass
 class LMCacheLookupOperation:
@@ -27,6 +30,18 @@ class LMCacheLookupOperation:
     total_hit_tokens: Optional[int] = None
     locks_held: bool = False
     lock_start: int = 0
+
+
+@dataclass
+class LMCacheBlendLookupOperation(LMCacheLookupOperation):
+    """Request-owned sparse matches, separate from contiguous prefix coverage.
+
+    ``total_hit_tokens`` still counts only the contiguous prefix. The result
+    remains attached to this operation until the caller finishes the request;
+    it must not be published as a prefix-cache entry.
+    """
+
+    blend_result: Optional["CBUnifiedLookupResult"] = None
 
 
 @dataclass(frozen=True)
