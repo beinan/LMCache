@@ -37,6 +37,7 @@ from lmcache.v1.multiprocess.modules.blend import retrieve as retrieve_mod
 from lmcache.v1.multiprocess.modules.blend.module import BlendModule
 from lmcache.v1.multiprocess.modules.blend.read_locks import ReadLockReservation
 from lmcache.v1.multiprocess.modules.blend.rope import _CBRopeState
+from lmcache.v1.multiprocess.modules.blend.store import fingerprint_namespace
 from lmcache.v1.multiprocess.token_codec import pack_token_ids
 import lmcache.lmcache_native as lmcache_native
 
@@ -754,7 +755,10 @@ def _run_lookup(
         f"{request_id}-hash{i}".encode() for i in range(_UNRETRIEVED_N_CHUNKS)
     ]
     indexed = blend._token_range_matcher.on_new_token_hashes(
-        stored_tokens, token_hashes, position_offset=0
+        stored_tokens,
+        token_hashes,
+        position_offset=0,
+        namespace=("m", world_size, "", ()),
     )
     assert indexed == _UNRETRIEVED_N_CHUNKS
 
@@ -1224,7 +1228,7 @@ def test_sparse_classify_fully_missing_chunk_still_strikes():
         hash_to_col,
         session=MagicMock(),
     ) == ([], 1)
-    assert eng._stale_strike == {b"gone": 1}
+    assert eng._stale_strike == {(fingerprint_namespace(key), b"gone"): 1}
     eng._token_range_matcher.remove_chunks.assert_not_called()
     eng._ctx.storage_manager.finish_read_prefetched.assert_not_called()
 
@@ -1236,7 +1240,9 @@ def test_sparse_classify_fully_missing_chunk_still_strikes():
         hash_to_col,
         session=MagicMock(),
     ) == ([], 1)
-    eng._token_range_matcher.remove_chunks.assert_called_once_with([b"gone"])
+    eng._token_range_matcher.remove_chunks.assert_called_once_with(
+        [b"gone"], namespace=fingerprint_namespace(key)
+    )
     assert eng._stale_strike == {}
 
 
@@ -1276,7 +1282,7 @@ def test_sparse_classify_unstaged_but_found_chunk_takes_no_strike():
     # "unstaged" exists -> skipped without a strike or a release.
     eng._ctx.storage_manager.finish_read_prefetched.assert_not_called()
     # "gone" is absent from every tier -> the stale path, unchanged.
-    assert eng._stale_strike == {b"gone": 1}
+    assert eng._stale_strike == {(fingerprint_namespace(key), b"gone"): 1}
 
 
 # ---------------------------------------------------------------------------

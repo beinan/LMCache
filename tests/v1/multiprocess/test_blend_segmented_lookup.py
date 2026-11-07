@@ -33,6 +33,7 @@ from lmcache.v1.mp_observability.event import EventType
 from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 from lmcache.v1.multiprocess.modules.blend.matcher import BlendTokenRangeMatcher
 from lmcache.v1.multiprocess.modules.blend.module import BlendModule
+from lmcache.v1.multiprocess.modules.blend.store import fingerprint_namespace
 from lmcache.v1.multiprocess.session import SessionManager
 from lmcache.v1.multiprocess.token_hasher import TokenHasher
 
@@ -105,7 +106,9 @@ def test_segmented_lookup_owns_tail_until_complete_or_cancelled(
     if mode in ("overlap", "missing_aux"):
         source = [7, 8, 9, 10]
         source_hashes = ctx.token_hasher.compute_chunk_hashes(source)
-        matcher.on_new_token_hashes(source, source_hashes)
+        matcher.on_new_token_hashes(
+            source, source_hashes, namespace=fingerprint_namespace(key)
+        )
         source_groups = ipc_key_to_object_keys(
             key, source_hashes, gids, DEFAULT_SHARD_REPLICATION_DESC
         )

@@ -3,6 +3,7 @@
 
 # Standard
 from bisect import bisect_right
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 import threading
@@ -43,6 +44,10 @@ from lmcache.v1.multiprocess.modules.blend.read_locks import ReadLockReservation
 from lmcache.v1.multiprocess.modules.blend.read_set import (
     _BlendReadGroups,
     _classify_cb_read_groups,
+)
+from lmcache.v1.multiprocess.modules.blend.store import (
+    FingerprintNamespace,
+    fingerprint_namespace,
 )
 from lmcache.v1.multiprocess.request_handler import HandlerType, request_handler
 from lmcache.v1.multiprocess.session import Session
@@ -113,9 +118,9 @@ class LookupMixin:
         _coordinator: "BlendCoordinatorClient | None"
         _segmented_prefix: bool
         _token_range_matcher: "BlendTokenRangeMatcher"
-        _pending_fp_hashes: set[bytes]
+        _pending_fp_hashes: Counter[tuple[FingerprintNamespace, bytes]]
         _pending_fp_lock: threading.Lock
-        _stale_strike: dict[bytes, int]
+        _stale_strike: dict[tuple[FingerprintNamespace, bytes], int]
         _STALE_STRIKE_THRESHOLD: int
 
         def _drain_fingerprints_sync(self) -> None: ...
@@ -125,7 +130,7 @@ class LookupMixin:
         (any order, possibly overlapping)."""
         self._drain_fingerprints_sync()
         return self._token_range_matcher.match_sub_sequence(
-            unpack_token_ids(key.token_bytes)
+            unpack_token_ids(key.token_bytes), namespace=fingerprint_namespace(key)
         )
 
     @staticmethod
@@ -251,6 +256,7 @@ class LookupMixin:
 
         Returns the found subset in cur_st order and the number of absent
         fingerprint chunks (excluding exact-prefix candidates)."""
+        namespace = fingerprint_namespace(key)
         found_cb_match_result: list[CBMatchResult] = []
         stale_hashes: list[bytes] = []
         partial_release_keys: list = []
@@ -296,22 +302,25 @@ class LookupMixin:
         if found_cb_match_result:
             with self._pending_fp_lock:
                 for r in found_cb_match_result:
-                    self._stale_strike.pop(r.hash, None)
+                    self._stale_strike.pop((namespace, r.hash), None)
         # Stale: keep while in-flight; evict at strike threshold.
         if stale_hashes:
             with self._pending_fp_lock:
                 truly_evict: list[bytes] = []
                 for h in stale_hashes:
-                    if h in self._pending_fp_hashes:
+                    scoped_hash = (namespace, h)
+                    if scoped_hash in self._pending_fp_hashes:
                         continue
-                    n = self._stale_strike.get(h, 0) + 1
+                    n = self._stale_strike.get(scoped_hash, 0) + 1
                     if n >= self._STALE_STRIKE_THRESHOLD:
                         truly_evict.append(h)
-                        self._stale_strike.pop(h, None)
+                        self._stale_strike.pop(scoped_hash, None)
                     else:
-                        self._stale_strike[h] = n
+                        self._stale_strike[scoped_hash] = n
             if truly_evict:
-                removed = self._token_range_matcher.remove_chunks(truly_evict)
+                removed = self._token_range_matcher.remove_chunks(
+                    truly_evict, namespace=namespace
+                )
                 if removed:
                     self._event_bus.publish(
                         Event(

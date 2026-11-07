@@ -26,6 +26,12 @@ blend/
                          expansion
 ```
 
+Local fingerprints, pending registrations, and stale strikes are scoped by
+model, world size, cache salt, and canonical `lmcache.tag.*` identity tags.
+Foreign lookup misses do not add stale strikes to another domain. All
+namespaces share the matcher's bounded table; no per-namespace table is allocated.
+Storage object identity remains the final check before a match is retrieved.
+
 The pure modules have no server context, streams, or event bus — they are
 CPU-testable by import. All mutable state is created in
 `BlendModule.__init__`; mixin methods share it on `self`.
@@ -109,6 +115,9 @@ success)`**
   (`submit_callback_to_stream`, kind `"cb_fingerprints"`) — stream-ordered
   after the L1 commit, so a fingerprint becomes matchable only once its
   chunk is readable. Fingerprint failures are logged, never raised.
+  Each queued job protects its hashes from stale eviction until indexing
+  finishes, whether lookup or the background worker drains it. Overlapping
+  re-stores retain that protection until their last job finishes.
 - Side effect (reorder enabled, worker 0, a store that committed KV): the
   request's prompt is recorded in the `PromptStore` (below).
 
