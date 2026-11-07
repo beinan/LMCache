@@ -475,6 +475,63 @@ class TestSGLangBlendLookup(unittest.TestCase):
         key = self.client.free_lookup_locks.call_args.args[0]
         self.assertEqual((key.start, key.end), (0, 8))
 
+    def test_partial_pages_require_v2_only_when_later_matches_remain(self) -> None:
+        early = CBMatchResult(0, 8, 8, 16, b"early")
+        later = CBMatchResult(8, 16, 16, 24, b"later")
+        self.connector.register_blend_rope(None, is_neox_style=False)
+        completed: MessagingFuture[bool] = MessagingFuture()
+        completed.set_result(True)
+        self.transfer.submit_blend_retrieve.return_value = completed
+        for has_later in (False, True):
+            with self.subTest(has_later=has_later):
+                reply: MessagingFuture[CBUnifiedLookupResult | None] = MessagingFuture()
+                reply.set_result(
+                    CBUnifiedLookupResult(0, [early, later] if has_later else [early])
+                )
+                self.client.cb_unified_lookup.return_value = reply
+                operation = self.connector.submit_blend_lookup(
+                    "partial", list(range(25)), local_hit_tokens=0, cache_salt=""
+                )
+                self.connector.poll_blend_lookup(operation)
+                self.transfer.submit_blend_retrieve.reset_mock()
+                self.transfer.create_recorded_event.reset_mock()
+                if has_later:
+                    with self.assertRaisesRegex(RuntimeError, "protocol v2"):
+                        self.connector.submit_blend_retrieve(
+                            operation, torch.arange(4, 20), matches=[early]
+                        )
+                    self.transfer.submit_blend_retrieve.assert_not_called()
+                    self.transfer.create_recorded_event.assert_not_called()
+                else:
+                    self.assertTrue(
+                        self.connector.submit_blend_retrieve(
+                            operation, torch.arange(4, 20), matches=[early]
+                        ).result(timeout=0)
+                    )
+                self.connector.finish_request("partial")
+
+    def test_chunked_protocol_accepts_increasing_retrieve_windows(self) -> None:
+        self.client.cb_protocol_handshake.return_value.result.return_value = (2, True)
+        early = CBMatchResult(0, 8, 8, 16, b"early")
+        later = CBMatchResult(8, 16, 16, 24, b"later")
+        self.future.set_result(CBUnifiedLookupResult(0, [early, later]))
+        self.connector.register_blend_rope(None, is_neox_style=False)
+        operation = self.connector.submit_blend_lookup(
+            "windows", list(range(24)), local_hit_tokens=0, cache_salt=""
+        )
+        self.connector.poll_blend_lookup(operation)
+        completed: MessagingFuture[bool] = MessagingFuture()
+        completed.set_result(True)
+        self.transfer.submit_blend_retrieve.return_value = completed
+        for match in (early, later):
+            self.assertTrue(
+                self.connector.submit_blend_retrieve(
+                    operation, torch.arange(4, 4 + match.cur_ed), matches=[match]
+                ).result(timeout=0)
+            )
+        self.assertEqual(self.transfer.submit_blend_retrieve.call_count, 2)
+        self.connector.finish_request("windows")
+
     def test_sparse_retrieve_requires_owned_matches_and_complete_allocation(
         self,
     ) -> None:

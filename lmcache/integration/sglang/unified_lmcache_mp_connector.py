@@ -303,7 +303,8 @@ class UnifiedLMCacheMPConnector:
         ) = self._build_engine_group_info_specs()
         self._req_client = RequestClientFactory.create(self.server_url)
         self._transfer_ctx: Optional["TransferContext"] = None
-        self._blend_protocol_ready = False
+        # A v1 handshake does not negotiate v2 even if the server advertises it.
+        self._blend_protocol_version = 0
         self._blend_rope_registered = False
         self._registered = False
         self._is_kv_writer = True
@@ -831,8 +832,9 @@ class UnifiedLMCacheMPConnector:
 
         Args:
             operation: Live, completed blend lookup for this request.
-            device_indices: Full request slot table per engine group, padded
-                to complete physical pages; not just the matched positions.
+            device_indices: Allocated slot table per engine group, starting at
+                token zero and padded to complete pages, not just matched slots.
+                Retaining matches beyond this window requires protocol v2.
             matches: Subset of the lookup's matches to load. None selects all
                 non-prefix and segmented-prefix matches.
             producer_stream: Stream whose work must precede the KV writes.
@@ -842,12 +844,16 @@ class UnifiedLMCacheMPConnector:
             KV, and retain the future and destination allocations until device
             completion. False requires recomputation. Complete this future
             before finishing the request; do not pass it to complete_load,
-            which consumes contiguous-prefix lock ownership.
+            which consumes contiguous-prefix lock ownership. For chunked
+            retrieval, send each match once in increasing windows and finish
+            the current future before submitting the next window.
 
         Raises:
-            RuntimeError: Retired/incomplete lookup or missing RoPE registration.
+            RuntimeError: Retired/incomplete lookup, missing RoPE registration,
+                or a server without the required chunked-retrieve protocol.
             ValueError: Foreign/duplicate matches or insufficient/invalid pages.
             NotImplementedError: The transfer context does not support blending.
+            TimeoutError: Chunked protocol or capability query exceeds RPC timeout.
         """
         if self._lookups.get(operation.request_id) is not operation:
             raise RuntimeError("Cannot retrieve a retired CacheBlend lookup")
@@ -867,11 +873,14 @@ class UnifiedLMCacheMPConnector:
             )
         group_indices = self._normalize_group_indices(device_indices)
         required_tokens = max((match.cur_ed for match in selected), default=0)
+        last_match_end = max((match.cur_ed for match in available), default=0)
+        allocated_end = last_match_end
         block_ids = []
         for group, indices in zip(self._kv_groups, group_indices, strict=True):
             covered_tokens = (
                 indices.numel() // group.slots_per_block * group.tokens_per_block
             )
+            allocated_end = min(allocated_end, covered_tokens)
             if covered_tokens < required_tokens:
                 raise ValueError("Destination pages must cover every selected match")
             blocks = self._slots_to_blocks(
@@ -894,6 +903,8 @@ class UnifiedLMCacheMPConnector:
             completed: MessagingFuture[bool] = MessagingFuture()
             completed.set_result(True)
             return completed
+        if allocated_end < last_match_end:
+            self._ensure_blend_protocol(2)
         key = self._create_key(
             operation,
             start=0,
@@ -1639,7 +1650,7 @@ class UnifiedLMCacheMPConnector:
         lookup.add_done_callback(on_lookup)
         return completion
 
-    def _ensure_blend_protocol(self) -> None:
+    def _ensure_blend_protocol(self, required_version: int = 1) -> None:
         if (
             self.kv_world_size != 1
             or self.mla_enabled
@@ -1651,12 +1662,14 @@ class UnifiedLMCacheMPConnector:
             )
         ):
             raise NotImplementedError("CacheBlend requires single-rank full MHA")
-        if not self._blend_protocol_ready:
-            version, compatible = self._req_client.cb_protocol_handshake(1).result(
-                timeout=self._mq_timeout
-            )
-            if version < 1 or not compatible:
-                raise RuntimeError("SGLang CacheBlend requires a compatible protocol")
+        if self._blend_protocol_version < required_version:
+            version, compatible = self._req_client.cb_protocol_handshake(
+                required_version
+            ).result(timeout=self._mq_timeout)
+            if version < required_version or not compatible:
+                raise RuntimeError(
+                    f"SGLang CacheBlend requires server protocol v{required_version}"
+                )
             features = self._req_client.get_experimental().result(
                 timeout=self._mq_timeout
             )
@@ -1665,4 +1678,4 @@ class UnifiedLMCacheMPConnector:
                     "SGLang CacheBlend requires the server capability "
                     f"{BLEND_ROTARY_COMPONENTS}"
                 )
-            self._blend_protocol_ready = True
+            self._blend_protocol_version = required_version

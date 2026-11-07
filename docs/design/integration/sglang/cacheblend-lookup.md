@@ -90,3 +90,18 @@ These methods are opt-in connector plumbing. Normal SGLang scheduling still
 needs to select recomputation tokens, restore residuals, and keep retrieved
 slots alive throughout selective execution. A successful transfer does not
 establish generation quality or a latency improvement.
+
+## Chunked retrieval
+
+Pass the allocated slot table from token zero through the current window and
+select only matches wholly covered by that window. When lookup matches remain
+beyond the allocated table, the connector requires protocol v2 before creating
+a device event or submitting a transfer. The explicit `blend_rotary_components`
+capability is still required: chunked lock retention and rotary support are
+independent contracts.
+
+Complete each retrieve future before submitting the next window, use increasing
+windows, and send each match once. An unmatched prompt suffix does not require
+v2 when every lookup match already fits: no later reservation needs retaining.
+This connector API does not itself enable chunked selective prefill in SGLang's
+scheduler.
