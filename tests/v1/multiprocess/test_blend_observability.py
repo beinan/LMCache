@@ -187,7 +187,7 @@ class TestPrefixLegNoGpuContext:
 
         handle, gids, windows, n_chunks, no_gpu_context = _bind(
             eng, "_submit_prefix_leg"
-        )(self._key(), 2)
+        )(self._key(), 2, MagicMock())
 
         assert handle is None
         assert (gids, windows, n_chunks) == ((), (), 0)
@@ -211,7 +211,7 @@ class TestPrefixLegNoGpuContext:
         eng._ctx.token_hasher.compute_packed_chunk_hashes.return_value = []
 
         handle, _, _, _, no_gpu_context = _bind(eng, "_submit_prefix_leg")(
-            self._key(), 2
+            self._key(), 2, MagicMock()
         )
 
         assert handle is None
@@ -224,7 +224,9 @@ class TestPollPrefixLegEvent:
         eng._ctx = MagicMock()
         job = SimpleNamespace(prefix_handle=None, prefix_lock_gids=())
 
-        leading, retained = _bind(eng, "_poll_prefix_leg")(job, "req-p", False)
+        leading, retained = _bind(eng, "_poll_prefix_leg")(
+            job, "req-p", False, MagicMock()
+        )
 
         assert (leading, retained) == (0, None)
         event_type, metadata, sid = _published(eng)[0]
@@ -365,6 +367,7 @@ class TestLookupOnlyRequestEnds:
         eng._cb_jobs_lock = threading.Lock()
         eng._cb_jobs = {rid: job}
         eng._coordinator = None
+        eng.configure_mock(_poll_unified_lookup=_bind(eng, "_poll_unified_lookup"))
         return eng
 
     def _key(self, rid, n_chunks):
@@ -379,6 +382,8 @@ class TestLookupOnlyRequestEnds:
         rid = "req-prefix-only"
         # Both legs done: prefix landed 4 chunks, sparse leg had nothing to fetch.
         job = _CBUnifiedJob(
+            session=MagicMock(),
+            started=True,
             matches=[],
             num_tokens=4 * _CHUNK,
             prefix_chunks=4,
@@ -403,6 +408,8 @@ class TestLookupOnlyRequestEnds:
     def test_miss_ends_the_request(self):
         rid = "req-miss"
         job = _CBUnifiedJob(
+            session=MagicMock(),
+            started=True,
             matches=[],
             num_tokens=2 * _CHUNK,
             prefix_chunks=0,
@@ -425,6 +432,8 @@ class TestLookupOnlyRequestEnds:
             old_st=0, old_ed=_CHUNK, cur_st=_CHUNK, cur_ed=2 * _CHUNK, hash=b"h"
         )
         job = _CBUnifiedJob(
+            session=MagicMock(),
+            started=True,
             matches=[match],
             num_tokens=3 * _CHUNK,
             prefix_chunks=1,

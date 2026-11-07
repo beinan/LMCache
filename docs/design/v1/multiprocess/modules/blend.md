@@ -93,6 +93,19 @@ success)`**
 - Side effect (reorder enabled, worker 0, a store that committed KV): the
   request's prompt is recorded in the `PromptStore` (below).
 
+## Abandoned lookups
+
+Session destruction removes a pending lookup from the job table and transfers
+its unconsumed prefetch handles to `StorageManager.discard_prefetch_task`.
+If the prefix has already completed while the sparse leg is pending, the
+prefix's retained reservations are released separately. Completed sparse
+reservations still use the existing session stash and retrieve cleanup.
+
+A per-job lock serializes each polling step with destruction; the job keeps
+the original session object so a completing poll cannot recreate a removed
+session. Different requests do not share that lock. Clients must stop issuing
+lookup/retrieve RPCs before ending the session.
+
 ## Unified lookup (submit-once, poll-on-recall)
 
 The handler never holds a worker thread across L2→L1 loads: the first call
