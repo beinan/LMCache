@@ -52,13 +52,19 @@ from lmcache.v1.multiprocess.token_codec import unpack_token_ids
 
 logger = init_logger(__name__)
 
-_BLEND_PROTOCOL_VERSION = 1
+#: Blend protocol version this server speaks. 2: a request may be retrieved
+#: over several CB_RETRIEVE_PRE_COMPUTED calls (one per engine prefill chunk)
+#: and keeps its unretrieved matches' read locks between them. The wire format
+#: is unchanged from 1, so version-1 clients stay compatible; a client that
+#: retrieves per chunk requires a server reporting 2 or later.
+_BLEND_PROTOCOL_VERSION = 2
+_COMPATIBLE_CLIENT_VERSIONS = frozenset({1, 2})
 
 
 def _handshake_response(client_version: int) -> tuple[int, bool]:
     return (
         _BLEND_PROTOCOL_VERSION,
-        1 <= client_version <= _BLEND_PROTOCOL_VERSION,
+        client_version in _COMPATIBLE_CLIENT_VERSIONS,
     )
 
 
@@ -118,9 +124,11 @@ class BlendModule(
         build_ctx.add_experimental(BLEND_ROTARY_COMPONENTS)
         return module
 
-    #: ``Session.extras`` key: ``{"key": lookup key, "per_hash": {hash: keys}}``
-    #: — the sparse lookup's read-lock reservation, consumed by exactly one
-    #: ``extras.pop`` (the retrieve, or :meth:`_release_unretrieved_locks`).
+    #: ``Session.extras`` key: the sparse lookup's
+    #: :class:`~lmcache.v1.multiprocess.modules.blend.read_locks.ReadLockReservation`.
+    #: Each retrieve claims a lock per key it reads and sweeps the matches no
+    #: later retrieve can send; session end releases the rest. All under
+    #: ``_cb_retain_lock``.
     UNRETRIEVED_KEYS_EXTRA = "cb.unretrieved_read_locked_keys"
 
     def __init__(
@@ -137,6 +145,9 @@ class BlendModule(
         # Retain the gapped prefix on a mid-prefix L2 retrieve failure
         # instead of truncating at the gap.
         self._segmented_prefix = enable_segmented_prefix
+        # Guards every request's read-lock reservation: TP ranks' retrieves,
+        # session end and a repeat lookup all touch it.
+        self._cb_retain_lock = threading.Lock()
         # Fleet-wide fingerprint directory; None => purely local matching.
         self._coordinator = coordinator
         self._dedup_content = enable_dedup_content
@@ -296,11 +307,11 @@ class BlendModule(
         return [P[i] for i in perm] if perm else []
 
     def _release_unretrieved_locks(self, session: Session) -> None:
-        """Retire abandoned lookup jobs and release unconsumed reservations.
+        """Retire lookup jobs, unconsumed reservations, and coordinator matches.
 
         Pending prefetch results transfer cleanup ownership to the storage
-        manager; no session callback waits for I/O. Session destruction is
-        the safe release point: the client must stop lookup/retrieve RPCs.
+        manager; no session callback waits for I/O. The reservation lock
+        serializes late retrieves with release of all unclaimed locks.
         """
         with self._cb_jobs_lock:
             job = self._cb_jobs.get(session.request_id)
@@ -311,15 +322,22 @@ class BlendModule(
         if job is not None:
             with job.lock:
                 self._discard_lookup_job(job)
-        stash = session.extras.pop(self.UNRETRIEVED_KEYS_EXTRA, None)
-        if not stash:
+        if self._coordinator is not None:
+            self._coordinator.take_match(session.request_id)
+        with self._cb_retain_lock:
+            reservation = session.extras.pop(self.UNRETRIEVED_KEYS_EXTRA, None)
+            if reservation is None:
+                return
+            to_release = reservation.release_all()
+        if not to_release:
             return
-        keys = [key for hash_keys in stash["per_hash"].values() for key in hash_keys]
-        # No retrieve consumed anything, so the full reservation is still held.
-        finish_lookup_read(self._ctx, stash["key"], keys, stash.get("l1_owners"))
+        for n, keys in to_release.items():
+            self._ctx.storage_manager.finish_read_prefetched(
+                keys, read_locks=n, l1_owners=reservation.l1_owners
+            )
         logger.info(
             "Released %d unretrieved read lock(s) for ended request %s",
-            len(keys),
+            sum(n * len(keys) for n, keys in to_release.items()),
             session.request_id,
         )
 

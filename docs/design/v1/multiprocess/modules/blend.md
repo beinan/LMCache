@@ -78,13 +78,18 @@ covers, `request_id` (session tracking), and `worker_id` (TP rank).
   matches beyond the prefix, `cur_st` order, each
   `(old_st, old_ed, cur_st, cur_ed, hash)`) — already sparse-prefetched,
   so the retrieve set equals this set.
+- With segmented-prefix reuse enabled, `segmented_prefix_segments` contains
+  complete post-gap chunks from the request's own hash chain, at their original
+  positions. These exact matches take precedence over overlapping fingerprint
+  matches. Recurrent registrations retain prefix-only behavior.
 - Side effects: sparse read locks taken and stashed on the session for the
   retrieve.
 
 **`cb_retrieve_pre_computed(key, matches, gpu_block_ids, instance_id,
 event_ipc) → (event_ipc, scatter_ran)`**
 
-- In: `matches` — the lookup's `non_prefix_segments`, any order;
+- In: `matches` — the lookup's `non_prefix_segments` and
+  `segmented_prefix_segments`, any order;
   `gpu_block_ids` — one block table per engine group, indexed by
   `engine_group_id`, possibly partially allocated (vLLM calls once per
   block-alloc round); `event_ipc` — the forward's CUDA event handle.
@@ -147,8 +152,15 @@ The two legs trim opposite ways:
 | Result | leading-ones count via the window-aware fold — truncate at the first gap; `SEGMENTED_PREFIX` additionally retains fully-loaded post-gap chunks (off for recurrent registrations) | keep every chunk whose **entire (read-group × rank) key set** loaded; no contiguity |
 | Why | vLLM consumes the prefix as one `num_computed_tokens`; recurrent state needs unbroken history | chunks relocate independently; the forward recomputes the holes |
 
-A chunk missing **any** rank's or **any** read group's key is dropped whole
-and takes a stale strike (evicted from the matcher at the strike threshold);
+Before reporting a segmented tail, the sparse leg reacquires its complete
+blend read set, including auxiliary groups. The prefix leg keeps its tail
+reservations until this handoff completes, then releases them and retains
+ownership of only the contiguous prefix. A tail missing auxiliary data is
+omitted without a matcher strike; overlapping fingerprint matches remain
+eligible. Cancellation releases whichever legs still own reservations.
+
+A fingerprint chunk missing **any** rank's or **any** read group's key is dropped
+whole and takes a stale strike (evicted from the matcher at the strike threshold);
 the rest of the request proceeds. The found set's object keys are stashed in
 `Session.extras` for the retrieve; whatever no retrieve consumes is released
 by the session-destroy listener.
@@ -175,6 +187,7 @@ reported with a fixed reason code on `CB_RETRIEVE_NOOP`:
 | `matches_beyond_alloc` | `True` (no publish) | **all** matches beyond the allocated slots | defer to vLLM's full-alloc follow-up call; locks stay held |
 | `matches_straddle_alloc` | `False` | **some** matches beyond the allocated slots while others are forwarded this step | client degrades the request to full recompute (TP-consensus, no raise) |
 | `no_object_keys` | `True` | nothing to read | silent full recompute |
+| `read_locks_not_held` | `False` | the request no longer holds a read lock on every key the call would read (no reservation, or already claimed or released) | client degrades the request; nothing is read |
 | read/scatter failure | `False` | prefetched objects unavailable, or an exception mid-scatter | client degrades the request |
 
 Invariant: `scatter_ran=True` implies every matched row the client forwards
@@ -228,11 +241,41 @@ returns `[]` on any error. Token ids only: no document boundaries are needed.
 
 ## Locks
 
-Sparse-prefetch read locks follow one rule: exactly one owner releases each
-reservation. The retrieve releases applied ranges stream-ordered after the
-scatter, releases lookup-stash orphans it will never read, and leaves
-beyond-slot-bound ranges locked for the follow-up call; anything never
-consumed by a retrieve is released on session destruction.
+The sparse lookup read-locks every object key of every match it finds,
+`ShardReplicationDesc.num_kv_readers(group_id)` times per key, and records the
+reservation on the session
+(`ReadLockReservation`, `modules/blend/read_locks.py`). Its ledger counts the
+locks the request still holds per key. Replicated groups can have different
+reader counts and physical KV ranks, including DCP token shards. The reservation
+keeps the lookup's replication descriptor and resolves each retrieve's worker
+through the same object-key mapping used by prefetch. Every lock leaves it
+exactly once:
+
+- **Claim.** A retrieve claims one lock on each key it will read, all or
+  nothing, and then owns that lock's release: stream-ordered after the
+  scatter, or by the storage read context when the read fails or raises.
+  The claim is the last step before the read: the configuration checks, the
+  import of the client's event and the sweep's release below, which can
+  raise, run before it. A call that cannot claim every key reads nothing and
+  returns `read_locks_not_held`: L1's read check only sees that *some*
+  request holds a lock, so reading a key this request no longer holds could
+  take another request's lock. Segmented-prefix tail chunks enter the same
+  reservation after the sparse prefetch acquires all blend groups. Their
+  prefix-leg locks are then released. A match outside this reservation is
+  refused the same way.
+- **Sweep.** A request can be retrieved over several calls, one per engine
+  prefill chunk. The client sends each match at most once, in the call whose
+  allocated window holds it whole, and calls arrive in increasing window
+  order. A call therefore releases every unsent match that ends at or before
+  its last sent match, and on the call that sees the whole prompt allocated
+  (`slot_bound >= key.end`, the only call of a single-shot request) every
+  unsent match.
+- **Session end and repeat lookups** release whatever is still held. A repeat
+  lookup (e.g. a preempted request resuming) installs a fresh reservation.
+
+All of it runs under `BlendModule._cb_retain_lock`; storage calls run outside
+it. The blend protocol version is 2 since this contract: a client that
+retrieves per chunk checks for it with `cb_protocol_handshake`.
 
 ## Observability
 

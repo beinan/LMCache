@@ -558,7 +558,7 @@ class TestSGLangBlendLookup(unittest.TestCase):
                 return_value=config,
             ),
             patch(
-                "lmcache.v1.multiprocess.transport.factory.RequestClientFactory.create",
+                "lmcache.v1.client.transport.factory.RequestClientFactory.create",
                 return_value=self.client,
             ),
             patch(
