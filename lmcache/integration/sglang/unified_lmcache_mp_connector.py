@@ -904,10 +904,10 @@ class UnifiedLMCacheMPConnector:
         Returns:
             Device-aware future. Wait on the forward stream before consuming
             KV, and retain the future and destination allocations until device
-            completion. False requires recomputation. Complete this future
-            before finishing the request; do not pass it to complete_load,
-            which consumes contiguous-prefix lock ownership. For chunked
-            retrieval, send each match once in increasing windows and finish
+            completion. Use complete_blend_retrieve to agree completion across
+            ranks before recomputation or finishing the request; do not pass it to
+            complete_load, which consumes contiguous-prefix lock ownership. For
+            chunked retrieval, send each match once in increasing windows and finish
             the current future before submitting the next window.
 
         Raises:
@@ -980,6 +980,42 @@ class UnifiedLMCacheMPConnector:
         future = transfer_ctx.submit_blend_retrieve(key, selected, block_ids, event)
         future.retain_reference(group_indices)
         return future
+
+    def complete_blend_retrieve(self, future: MessagingFuture[bool]) -> bool:
+        """Wait for sparse KV writes and agree their outcome across TP ranks.
+
+        Args:
+            future: This rank's device-aware future from submit_blend_retrieve.
+                Every rank must complete the same request/window in order.
+
+        Returns:
+            True only if every rank finished successfully. False means every
+            future completed normally but at least one rank declined retrieval;
+            all ranks must recompute the selected spans. Prefix locks are not
+            consumed by this method.
+
+        Raises:
+            Exception: Local RPC/device error, or RuntimeError for a peer's
+                error. Such errors are fatal to this forward pass: they do not
+                establish that the failed rank stopped writing its destinations.
+                Do not catch them to recompute or recycle the affected slots.
+
+        Notes:
+            Waits without a timeout, including device completion. A response
+            timeout cannot establish that remote writes finished. Each rank
+            drains its own successful transfer before reporting a peer error.
+            This does not coordinate submission failures: all ranks must have
+            obtained their futures before calling this method.
+        """
+        error = None
+        success = False
+        try:
+            success = future.result()
+        except Exception as exc:
+            logger.exception("CacheBlend transfer completion failed")
+            error = exc
+        self._raise_blend_error(error)
+        return self._sync_success(success)
 
     def poll_lookup(self, operation: LMCacheLookupOperation) -> Optional[int]:
         """Return contiguous prefix coverage, or None while prefetch runs.
@@ -1757,8 +1793,8 @@ class UnifiedLMCacheMPConnector:
             self._blend_protocol_version = required_version
 
     def _raise_blend_error(self, error: Exception | None) -> None:
-        """Raise a local RPC error, or report its failure to peer TP ranks."""
+        """Raise a local operation error, or report its failure to peer TP ranks."""
         if not self._sync_success(error is None):
             if error is not None:
                 raise error
-            raise RuntimeError("CacheBlend RPC failed on another TP rank")
+            raise RuntimeError("CacheBlend operation failed on another TP rank")

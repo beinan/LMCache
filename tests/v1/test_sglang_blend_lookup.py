@@ -23,6 +23,7 @@ from lmcache.integration.sglang.lmcache_mp_metadata import (
 from lmcache.integration.sglang.unified_lmcache_mp_connector import (
     UnifiedLMCacheMPConnector,
 )
+from lmcache.v1.mp_observability.errors import LMCacheTimeoutError
 from lmcache.v1.multiprocess.custom_types import CBMatchResult, CBUnifiedLookupResult
 from lmcache.v1.multiprocess.futures import MessagingFuture
 
@@ -622,6 +623,22 @@ class TestSGLangBlendLookup(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "register_blend_rope"):
             self.connector.submit_blend_retrieve(lookup, torch.arange(16))
 
+    def test_complete_blend_retrieve_preserves_single_rank_outcome(self) -> None:
+        for outcome in (True, False, ConnectionError("disconnected")):
+            with self.subTest(outcome=outcome):
+                future: MessagingFuture[bool] = MessagingFuture()
+                if isinstance(outcome, Exception):
+                    future.set_exception(outcome)
+                    with self.assertRaises(ConnectionError):
+                        self.connector.complete_blend_retrieve(future)
+                else:
+                    future.set_result(outcome)
+                    self.assertIs(
+                        self.connector.complete_blend_retrieve(future), outcome
+                    )
+        self.client.free_lookup_locks.assert_not_called()
+        self.client.end_session.assert_not_called()
+
     def test_tp_lookup_agreement_and_leader_owned_cleanup(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             mp.spawn(
@@ -656,6 +673,41 @@ class TestSGLangBlendLookup(unittest.TestCase):
             tp_group=dist.group.WORLD,
         )
         try:
+            outcomes: list[bool | Exception] = [
+                True,
+                False,
+                ConnectionError("disconnected"),
+                LMCacheTimeoutError("late"),
+            ]
+            for index, outcome in enumerate(outcomes):
+                # A peer's refusal/error must wait for this rank's device writes.
+                marker = Path(rendezvous.removeprefix("file://")).with_name(
+                    f"device-complete-{index}"
+                )
+                raw: MessagingFuture[tuple[bytes, bool]] = MessagingFuture()
+                backend = Mock()
+                if rank == 0:
+                    if isinstance(outcome, Exception):
+                        raw.set_exception(outcome)
+                    else:
+                        raw.set_result((b"", outcome))
+                else:
+                    raw.set_result((b"event", True))
+                    backend.synchronize_event.side_effect = (
+                        lambda *_, path=marker: path.write_text("complete")
+                    )
+                future = raw.to_device_future(device="cpu", event_backend=backend)
+                if isinstance(outcome, Exception):
+                    with case.assertRaises((type(outcome), RuntimeError)):
+                        connector.complete_blend_retrieve(future)
+                else:
+                    case.assertIs(connector.complete_blend_retrieve(future), outcome)
+                case.assertTrue(marker.exists())
+                if rank == 1:
+                    backend.synchronize_event.assert_called_once()
+                case.client.free_lookup_locks.assert_not_called()
+                case.client.end_session.assert_not_called()
+
             case.client.cb_protocol_handshake.return_value.result.return_value = (
                 1,
                 False,

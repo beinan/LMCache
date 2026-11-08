@@ -114,6 +114,21 @@ needs to select recomputation tokens, restore residuals, and keep retrieved
 slots alive throughout selective execution. A successful transfer does not
 establish generation quality or a latency improvement.
 
+## Collective transfer completion
+
+After every rank has obtained its retrieve future, call
+`complete_blend_retrieve(future)` in the same request/window order. It waits for
+each local device transfer and returns one shared outcome. A normal `False`
+result on any rank makes all ranks recompute those spans after their writes have
+finished. It does not release contiguous-prefix locks.
+
+RPC, event-import and device errors raise on all ranks. They are fatal to the
+forward pass, not permission to reuse destination slots: an error does not prove
+that the failed rank's remote writes stopped. Successful peers finish their
+writes before raising. There is deliberately no completion timeout that could
+be mistaken for permission to fall back. Submission failure agreement remains
+separate work, so sparse submission still rejects multiple ranks.
+
 ## Chunked retrieval
 
 Pass the allocated slot table from token zero through the current window and
