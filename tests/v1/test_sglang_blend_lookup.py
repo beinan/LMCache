@@ -664,7 +664,7 @@ class TestSGLangBlendLookup(unittest.TestCase):
             [
                 SGLangKVComponentGroup(
                     "full",
-                    tuple(torch.empty(32, 2, 8) for _ in range(2)),
+                    tuple(torch.empty(64, 2, 8) for _ in range(2)),
                     rope_num_layers=1,
                 )
             ],
@@ -742,12 +742,73 @@ class TestSGLangBlendLookup(unittest.TestCase):
             case.assertEqual(connector.poll_blend_lookup(operation), result)
             case.assertEqual(connector.poll_lookup(operation), 8)
             case.assertEqual(connector.get_store_start("mixed", 32), 8)
-            with case.assertRaisesRegex(NotImplementedError, "single rank"):
-                connector.register_blend_rope(None, is_neox_style=False)
-            with case.assertRaisesRegex(NotImplementedError, "single rank"):
-                connector.submit_blend_retrieve(operation, torch.arange(4, 36))
+            with case.assertRaises((ValueError, RuntimeError)):
+                connector.register_blend_rope(
+                    torch.empty(16, 3) if rank == 0 else None, is_neox_style=False
+                )
             case.transfer.register_blend_rope.assert_not_called()
+            if rank == 1:
+                case.transfer.register_blend_rope.side_effect = ConnectionError(
+                    "registration failed"
+                )
+            with case.assertRaises((ConnectionError, RuntimeError)):
+                connector.register_blend_rope(None, is_neox_style=False)
+            with case.assertRaisesRegex(RuntimeError, "register_blend_rope"):
+                connector.submit_blend_retrieve(operation, torch.arange(4, 36))
             case.transfer.submit_blend_retrieve.assert_not_called()
+            case.transfer.register_blend_rope.side_effect = None
+            connector.register_blend_rope(None, is_neox_style=False)
+            case.assertEqual(case.transfer.register_blend_rope.call_count, 2)
+
+            with case.assertRaises((ValueError, RuntimeError)):
+                connector.submit_blend_retrieve(
+                    operation, torch.arange(4, 20 if rank == 1 else 36)
+                )
+            case.transfer.create_recorded_event.assert_not_called()
+            case.transfer.submit_blend_retrieve.assert_not_called()
+
+            # Only one rank needs v2 for its shorter allocated window.
+            case.client.cb_protocol_handshake.return_value.result.return_value = (
+                2,
+                True,
+            )
+            ready: MessagingFuture[bool] = MessagingFuture()
+            ready.set_result(True)
+            case.transfer.submit_blend_retrieve.return_value = ready
+            transferred = connector.submit_blend_retrieve(
+                operation,
+                torch.arange(4, 28 if rank == 1 else 36),
+                matches=result.segmented_prefix_segments,
+            )
+            case.assertTrue(connector.complete_blend_retrieve(transferred))
+            retrieve_key = case.transfer.submit_blend_retrieve.call_args.args[0]
+            case.assertEqual(retrieve_key.worker_id, rank)
+            case.assertEqual(retrieve_key.request_id, operation.session_id)
+            if rank == 0:
+                case.client.cb_protocol_handshake.assert_called_with(2)
+
+            drained = Path(rendezvous.removeprefix("file://")).with_name("drained")
+            raw_transfer: MessagingFuture[tuple[bytes, bool]] = MessagingFuture()
+            raw_transfer.set_result((b"submitted-event", True))
+            transfer_backend = Mock()
+            transfer_backend.synchronize_event.side_effect = (
+                lambda *_: drained.write_text("complete")
+            )
+            case.transfer.submit_blend_retrieve.return_value = (
+                raw_transfer.to_device_future(
+                    device="cpu", event_backend=transfer_backend
+                )
+            )
+            if rank == 0:
+                case.transfer.submit_blend_retrieve.side_effect = ConnectionError(
+                    "submission failed"
+                )
+            with case.assertRaises((ConnectionError, RuntimeError)):
+                connector.submit_blend_retrieve(operation, torch.arange(4, 36))
+            case.assertTrue(drained.exists())
+            if rank == 1:
+                transfer_backend.synchronize_event.assert_called_once()
+            case.transfer.submit_blend_retrieve.side_effect = None
             connector.free_lookup_locks("mixed", 0, 8)
             connector.finish_request("mixed")
             if rank == 0:

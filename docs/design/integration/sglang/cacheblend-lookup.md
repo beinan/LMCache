@@ -6,8 +6,8 @@ scheduler. Lookup accepts full-MHA tensor-parallel registrations; pipeline
 parallelism remains unsupported. It requires a compatible base blend protocol
 plus the `blend_rotary_components` feature from `GET_EXPERIMENTAL`. The feature confirms separate rotary and value
 components; a newer protocol version alone does not. Both checks run before
-the first blend lookup. Sparse transfer and rotary registration still require a
-single rank until cross-rank transfer completion is supported.
+the first blend lookup or rotary registration. Tensor-parallel ranks register
+their own rotary tables and retrieve into their own allocated KV pages.
 
 ## Ownership and prefix semantics
 
@@ -60,8 +60,8 @@ remote cleanup. Callers must finish submitted retrieves before retiring the
 request, because H2D completion owns their lock release.
 
 The client tests establish RPC and metadata ownership, not that selective
-generation is complete. Multi-rank model execution, transfer completion and PP
-match distribution remain separate integration work.
+generation is complete. Multi-rank model execution still needs end-to-end
+validation; PP match distribution remains separate integration work.
 
 ## Tensor-parallel lookup agreement
 
@@ -80,10 +80,16 @@ session. Other ranks retire their local operation immediately. A subsequent
 request reusing the engine ID receives a new shared server ID, so a late reply
 cannot end the new session.
 
-This enables TP lookup metadata, not TP sparse inference. Rotary registration
-and sparse retrieve explicitly reject multiple ranks before submitting device
-work. Transfer completion must be agreed across ranks before removing that gate;
-a rank-local success must not choose sparse execution while a peer recomputes.
+TP ranks must use the same request and selected matches in the same order.
+Rotary registration first agrees local validation, then waits for every rank's
+acknowledgement before enabling retrieval. A failed registration leaves readiness
+disabled on all ranks; model-owned tables remain alive until context teardown.
+
+Retrieve validation is also agreed before any device submission. The protocol
+version is the maximum required by the ranks' allocated windows. A submission
+error may occur after a peer has begun writing, so successful peers drain their
+futures before all ranks raise. Such errors are fatal to the forward pass;
+unknown completion does not permit recomputation or destination reuse.
 
 ## Explicit rotary registration and sparse retrieve
 
@@ -126,8 +132,8 @@ RPC, event-import and device errors raise on all ranks. They are fatal to the
 forward pass, not permission to reuse destination slots: an error does not prove
 that the failed rank's remote writes stopped. Successful peers finish their
 writes before raising. There is deliberately no completion timeout that could
-be mistaken for permission to fall back. Submission failure agreement remains
-separate work, so sparse submission still rejects multiple ranks.
+be mistaken for permission to fall back. Submission failure agreement drains
+successful peers through this same completion path before raising on every rank.
 
 ## Chunked retrieval
 

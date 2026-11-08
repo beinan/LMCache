@@ -685,8 +685,8 @@ class UnifiedLMCacheMPConnector:
         Notes:
             All TP ranks must call submit, poll and finish in the same request
             order. Only the leader issues lookup RPCs; every rank receives the
-            same session ID and complete result. Sparse transfers still require
-            one rank until collective transfer completion is supported.
+            same session ID and complete result. Each rank retrieves its own KV
+            shard and agrees completion before selective execution.
 
         Raises:
             NotImplementedError: Pipeline-parallel or non-full-MHA geometry.
@@ -835,33 +835,38 @@ class UnifiedLMCacheMPConnector:
 
         Raises:
             ValueError: Invalid table geometry or device.
-            NotImplementedError: Multi-rank geometry, layout or transfer context.
+            NotImplementedError: Unsupported geometry, layout or transfer context.
             RuntimeError: KV registration is absent, protocol is incompatible,
-                or the server lacks rotary component support.
+                the server lacks rotary component support, or a peer's
+                registration fails.
             TimeoutError: Registration, protocol, or capability query times out.
 
-        Call during model initialization, before submitting blend retrieves.
+        All TP ranks must call this method in the same order during model
+        initialization, before submitting blend retrieves. Readiness is enabled
+        only after all ranks acknowledge registration.
         Models with distinct per-layer rotary tables need separate registration
         metadata and are not represented by this shared-table API.
         """
-        if self.kv_world_size != 1:
-            raise NotImplementedError("CacheBlend transfers require a single rank")
         self._ensure_blend_protocol()
+        self._blend_rope_registered = False
         transfer_ctx = self._transfer_ctx
-        if transfer_ctx is None:
-            raise RuntimeError("LMCache KV tensors are not registered")
         head_sizes = [int(group.kv_tensors[0].shape[-1]) for group in self._kv_groups]
+        error: Exception | None = None
+        if transfer_ctx is None:
+            error = RuntimeError("LMCache KV tensors are not registered")
+        elif cos_sin_cache is not None and (
+            cos_sin_cache.ndim != 2
+            or cos_sin_cache.shape[1] == 0
+            or cos_sin_cache.shape[1] % 2
+            or cos_sin_cache.shape[1] > min(head_sizes)
+            or cos_sin_cache.device != self.device
+        ):
+            error = ValueError(
+                "RoPE table must have even width within each KV head on its device"
+            )
+        self._raise_blend_error(error)
+        assert transfer_ctx is not None
         if cos_sin_cache is not None:
-            if (
-                cos_sin_cache.ndim != 2
-                or cos_sin_cache.shape[1] == 0
-                or cos_sin_cache.shape[1] % 2
-                or cos_sin_cache.shape[1] > min(head_sizes)
-                or cos_sin_cache.device != self.device
-            ):
-                raise ValueError(
-                    "RoPE table must have even width within each KV head on its device"
-                )
             width = int(cos_sin_cache.shape[1])
             caches = [cos_sin_cache]
             group_to_cache = [0] * len(head_sizes)
@@ -870,16 +875,20 @@ class UnifiedLMCacheMPConnector:
             caches = []
             group_to_cache = [-1] * len(head_sizes)
             group_rot = [[] for _ in head_sizes]
-        self._blend_rope_registered = False
-        transfer_ctx.register_blend_rope(
-            caches,
-            head_sizes[0],
-            is_neox_style,
-            group_to_cache,
-            group_rot,
-            head_sizes,
-            self._mq_timeout,
-        )
+        try:
+            transfer_ctx.register_blend_rope(
+                caches,
+                head_sizes[0],
+                is_neox_style,
+                group_to_cache,
+                group_rot,
+                head_sizes,
+                self._mq_timeout,
+            )
+        except Exception as exc:
+            logger.exception("CacheBlend rotary registration failed")
+            error = exc
+        self._raise_blend_error(error)
         self._blend_rope_registered = True
 
     def submit_blend_retrieve(
@@ -914,71 +923,104 @@ class UnifiedLMCacheMPConnector:
             RuntimeError: Retired/incomplete lookup, missing RoPE registration,
                 or a server without the required chunked-retrieve protocol.
             ValueError: Foreign/duplicate matches or insufficient/invalid pages.
-            NotImplementedError: Multi-rank geometry or a transfer context
-                that does not support blending.
+            NotImplementedError: The transfer context does not support blending.
             TimeoutError: Chunked protocol or capability query exceeds RPC timeout.
+            Exception: Local submission/device error, or RuntimeError for a peer.
+                Such errors are fatal; they do not authorize destination reuse.
+
+        Notes:
+            Every TP rank must submit the same request and selected matches in
+            order. Local validation errors are agreed before submitting device
+            work. On a submission failure, successful peers drain their writes
+            before all ranks raise. Complete every returned future through
+            complete_blend_retrieve before retiring the shared session.
         """
-        if self.kv_world_size != 1:
-            raise NotImplementedError("CacheBlend transfers require a single rank")
-        if self._lookups.get(operation.request_id) is not operation:
-            raise RuntimeError("Cannot retrieve a retired CacheBlend lookup")
-        result = operation.blend_result
-        if result is None:
-            raise RuntimeError("CacheBlend retrieve requires a completed lookup")
-        transfer_ctx = self._transfer_ctx
-        if transfer_ctx is None or not self._blend_rope_registered:
-            raise RuntimeError("Call register_blend_rope before CacheBlend retrieve")
-        available = [*result.non_prefix_segments, *result.segmented_prefix_segments]
-        selected = available if matches is None else list(matches)
-        available_keys = {_blend_match_key(match) for match in available}
-        selected_keys = {_blend_match_key(match) for match in selected}
-        if not selected_keys <= available_keys or len(selected_keys) != len(selected):
-            raise ValueError(
-                "Select distinct matches from this lookup's prefetched result"
-            )
-        group_indices = self._normalize_group_indices(device_indices)
-        required_tokens = max((match.cur_ed for match in selected), default=0)
-        last_match_end = max((match.cur_ed for match in available), default=0)
-        allocated_end = last_match_end
-        block_ids = []
-        for group, indices in zip(self._kv_groups, group_indices, strict=True):
-            covered_tokens = (
-                indices.numel() // group.slots_per_block * group.tokens_per_block
-            )
-            allocated_end = min(allocated_end, covered_tokens)
-            if covered_tokens < required_tokens:
-                raise ValueError("Destination pages must cover every selected match")
-            blocks = self._slots_to_blocks(
-                indices, slots_per_block=group.slots_per_block
-            )
-            for match in selected:
-                first = match.cur_st // group.tokens_per_block
-                last = (
-                    match.cur_ed + group.tokens_per_block - 1
-                ) // group.tokens_per_block
-                if any(
-                    not 0 < block < group.kv_tensors[0].shape[0]
-                    for block in blocks[first:last]
-                ):
+        error: Exception | None = None
+        try:
+            if self._lookups.get(operation.request_id) is not operation:
+                raise RuntimeError("Cannot retrieve a retired CacheBlend lookup")
+            result = operation.blend_result
+            if result is None:
+                raise RuntimeError("CacheBlend retrieve requires a completed lookup")
+            transfer_ctx = self._transfer_ctx
+            if transfer_ctx is None or not self._blend_rope_registered:
+                raise RuntimeError(
+                    "Call register_blend_rope before CacheBlend retrieve"
+                )
+            available = [*result.non_prefix_segments, *result.segmented_prefix_segments]
+            selected = available if matches is None else list(matches)
+            available_keys = {_blend_match_key(match) for match in available}
+            selected_keys = {_blend_match_key(match) for match in selected}
+            if not selected_keys <= available_keys or len(selected_keys) != len(
+                selected
+            ):
+                raise ValueError(
+                    "Select distinct matches from this lookup's prefetched result"
+                )
+            group_indices = self._normalize_group_indices(device_indices)
+            required_tokens = max((match.cur_ed for match in selected), default=0)
+            last_match_end = max((match.cur_ed for match in available), default=0)
+            allocated_end = last_match_end
+            block_ids = []
+            for group, indices in zip(self._kv_groups, group_indices, strict=True):
+                covered_tokens = (
+                    indices.numel() // group.slots_per_block * group.tokens_per_block
+                )
+                allocated_end = min(allocated_end, covered_tokens)
+                if covered_tokens < required_tokens:
                     raise ValueError(
-                        "Matched destinations must be valid non-padding KV pages"
+                        "Destination pages must cover every selected match"
                     )
-            block_ids.append(blocks)
-        if not selected:
-            completed: MessagingFuture[bool] = MessagingFuture()
-            completed.set_result(True)
-            return completed
-        if allocated_end < last_match_end:
-            self._ensure_blend_protocol(2)
-        key = self._create_key(
-            operation,
-            start=0,
-            end=len(operation.token_ids),
-            worker_id=self.kv_worker_id,
+                blocks = self._slots_to_blocks(
+                    indices, slots_per_block=group.slots_per_block
+                )
+                for match in selected:
+                    first = match.cur_st // group.tokens_per_block
+                    last = (
+                        match.cur_ed + group.tokens_per_block - 1
+                    ) // group.tokens_per_block
+                    if any(
+                        not 0 < block < group.kv_tensors[0].shape[0]
+                        for block in blocks[first:last]
+                    ):
+                        raise ValueError(
+                            "Matched destinations must be valid non-padding KV pages"
+                        )
+                block_ids.append(blocks)
+        except (ValueError, RuntimeError) as exc:
+            error = exc
+        self._raise_blend_error(error)
+        assert transfer_ctx is not None
+        required_version = self._sync_leader_int(
+            2 if selected and allocated_end < last_match_end else 1
         )
-        event = self._create_recorded_event(transfer_ctx, producer_stream)
-        future = transfer_ctx.submit_blend_retrieve(key, selected, block_ids, event)
+        self._ensure_blend_protocol(required_version)
+        future: MessagingFuture[bool]
+        if not selected:
+            future = MessagingFuture()
+            future.set_result(True)
+        else:
+            key = self._create_key(
+                operation,
+                start=0,
+                end=len(operation.token_ids),
+                worker_id=self.kv_worker_id,
+            )
+            try:
+                event = self._create_recorded_event(transfer_ctx, producer_stream)
+                future = transfer_ctx.submit_blend_retrieve(
+                    key, selected, block_ids, event
+                )
+            except Exception as exc:
+                logger.exception("CacheBlend retrieve submission failed")
+                error = exc
+                future = MessagingFuture()
+                future.set_exception(exc)
         future.retain_reference(group_indices)
+        if not self._sync_success(error is None):
+            # Successful peers must finish writes before a submission error
+            # leaves the forward pass. Failed ranks cannot safely recompute.
+            self.complete_blend_retrieve(future)
         return future
 
     def complete_blend_retrieve(self, future: MessagingFuture[bool]) -> bool:
