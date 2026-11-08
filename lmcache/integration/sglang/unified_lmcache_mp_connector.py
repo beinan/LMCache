@@ -1046,6 +1046,7 @@ class UnifiedLMCacheMPConnector:
             Waits without a timeout, including device completion. A response
             timeout cannot establish that remote writes finished. Each rank
             drains its own successful transfer before reporting a peer error.
+            A normal retrieval refusal never masks a peer's RPC/device error.
             This does not coordinate submission failures: all ranks must have
             obtained their futures before calling this method.
         """
@@ -1056,8 +1057,16 @@ class UnifiedLMCacheMPConnector:
         except Exception as exc:
             logger.exception("CacheBlend transfer completion failed")
             error = exc
-        self._raise_blend_error(error)
-        return self._sync_success(success)
+        outcomes = torch.tensor(
+            [error is None, success], dtype=torch.int32, device="cpu"
+        )
+        self._parallel_all_reduce(outcomes, dist.ReduceOp.MIN)
+        error_free, retrieved = outcomes.tolist()
+        if not error_free:
+            if error is not None:
+                raise error
+            raise RuntimeError("CacheBlend operation failed on another TP rank")
+        return bool(retrieved)
 
     def poll_lookup(self, operation: LMCacheLookupOperation) -> Optional[int]:
         """Return contiguous prefix coverage, or None while prefetch runs.

@@ -708,6 +708,15 @@ class TestSGLangBlendLookup(unittest.TestCase):
                 case.client.free_lookup_locks.assert_not_called()
                 case.client.end_session.assert_not_called()
 
+            refused_or_failed: MessagingFuture[bool] = MessagingFuture()
+            if rank == 0:
+                refused_or_failed.set_result(False)
+            else:
+                refused_or_failed.set_exception(ConnectionError("disconnected"))
+            expected_error = RuntimeError if rank == 0 else ConnectionError
+            with case.assertRaises(expected_error):
+                connector.complete_blend_retrieve(refused_or_failed)
+
             case.client.cb_protocol_handshake.return_value.result.return_value = (
                 1,
                 False,
