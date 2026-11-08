@@ -2,11 +2,12 @@
 
 The explicit `submit_blend_lookup` / `poll_blend_lookup` API prepares matches
 for selective prefill. It is not enabled by the existing unified radix-cache
-scheduler. It currently accepts single-rank full MHA registrations and requires
-a compatible base blend protocol plus the `blend_rotary_components` feature
-from `GET_EXPERIMENTAL`. The feature confirms separate rotary and value
+scheduler. Lookup accepts full-MHA tensor-parallel registrations; pipeline
+parallelism remains unsupported. It requires a compatible base blend protocol
+plus the `blend_rotary_components` feature from `GET_EXPERIMENTAL`. The feature confirms separate rotary and value
 components; a newer protocol version alone does not. Both checks run before
-RoPE registration or the first blend lookup.
+the first blend lookup. Sparse transfer and rotary registration still require a
+single rank until cross-rank transfer completion is supported.
 
 ## Ownership and prefix semantics
 
@@ -59,8 +60,30 @@ remote cleanup. Callers must finish submitted retrieves before retiring the
 request, because H2D completion owns their lock release.
 
 The client tests establish RPC and metadata ownership, not that selective
-generation is complete. Model execution and TP/PP match distribution remain
-separate integration work.
+generation is complete. Multi-rank model execution, transfer completion and PP
+match distribution remain separate integration work.
+
+## Tensor-parallel lookup agreement
+
+All TP ranks submit and poll requests in the same order. Only TP rank zero
+negotiates the server capabilities and issues lookup RPCs. It broadcasts one
+session ID and the complete lookup result through the connector's CPU TP group;
+non-prefix and segmented-prefix spans remain distinct. All ranks observe the
+same pending/completed state and contiguous store cursor. RPC errors are agreed
+before broadcasting a result: the failing rank raises its original exception,
+and peers raise `RuntimeError`. Call `finish_request` on every rank after a failure,
+including submission failures for which no operation was returned.
+
+Only the leader releases prefix locks and sends `END_SESSION`. Its existing
+callback chain waits for an outstanding lookup reply before retiring the shared
+session. Other ranks retire their local operation immediately. A subsequent
+request reusing the engine ID receives a new shared server ID, so a late reply
+cannot end the new session.
+
+This enables TP lookup metadata, not TP sparse inference. Rotary registration
+and sparse retrieve explicitly reject multiple ranks before submitting device
+work. Transfer completion must be agreed across ranks before removing that gate;
+a rank-local success must not choose sparse execution while a peer recomputes.
 
 ## Explicit rotary registration and sparse retrieve
 

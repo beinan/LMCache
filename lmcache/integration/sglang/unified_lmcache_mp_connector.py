@@ -668,7 +668,7 @@ class UnifiedLMCacheMPConnector:
         local_hit_tokens: int,
         cache_salt: str,
     ) -> LMCacheBlendLookupOperation:
-        """Start a request-owned CacheBlend lookup for single-rank full MHA.
+        """Start a request-owned CacheBlend lookup for full-MHA TP ranks.
 
         Args:
             request_id: Unique live request identifier.
@@ -682,19 +682,36 @@ class UnifiedLMCacheMPConnector:
             Its independent server session permits reuse of a finished engine
             request ID while the previous session is still retiring.
 
+        Notes:
+            All TP ranks must call submit, poll and finish in the same request
+            order. Only the leader issues lookup RPCs; every rank receives the
+            same session ID and complete result. Sparse transfers still require
+            one rank until collective transfer completion is supported.
+
         Raises:
-            NotImplementedError: Parallel or non-full-MHA cache geometry.
+            NotImplementedError: Pipeline-parallel or non-full-MHA geometry.
             RuntimeError: Duplicate request, incompatible protocol, or server
                 without rotary component support.
             TimeoutError: Protocol or capability query exceeds the RPC timeout.
         """
-        if request_id in self._lookups or request_id in self._active_sessions:
+        if not self._sync_success(
+            request_id not in self._lookups and request_id not in self._active_sessions
+        ):
             raise RuntimeError(f"LMCache request already exists for {request_id}")
         self._ensure_blend_protocol()
         self._ensure_heartbeat_started()
+        session_ids = [
+            f"{request_id}:{uuid.uuid4().hex}" if self.is_lookup_leader else ""
+        ]
+        if self.tp_size > 1:
+            dist.broadcast_object_list(
+                session_ids,
+                src=dist.get_global_rank(self.tp_group, 0),
+                group=self.tp_group,
+            )
         operation = LMCacheBlendLookupOperation(
             request_id=request_id,
-            session_id=f"{request_id}:{uuid.uuid4().hex}",
+            session_id=session_ids[0],
             token_ids=list(token_ids),
             local_hit_tokens=local_hit_tokens,
             cache_salt=cache_salt,
@@ -713,8 +730,18 @@ class UnifiedLMCacheMPConnector:
                     "lmcache.hint.engine_computed_tokens": local_hit_tokens
                 },
             )
-            operation.submission_future = self._req_client.cb_unified_lookup(key, 1)
+            self._lookups[request_id] = operation
             self._active_sessions.add(request_id)
+            error = None
+            if self.is_lookup_leader:
+                try:
+                    operation.submission_future = self._req_client.cb_unified_lookup(
+                        key, self.tp_size
+                    )
+                except Exception as exc:
+                    logger.exception("CacheBlend lookup submission failed")
+                    error = exc
+            self._raise_blend_error(error)
         self._lookups[request_id] = operation
         return operation
 
@@ -731,6 +758,8 @@ class UnifiedLMCacheMPConnector:
             Repeated calls after completion return the same result.
 
         Notes:
+            Every TP rank must poll in the same order. Only the leader polls
+            the RPC; pending/results and failures are shared with its peers.
             Only contiguous prefix coverage advances the request's store cursor;
             sparse and segmented matches do not establish a stored prefix.
 
@@ -738,28 +767,48 @@ class UnifiedLMCacheMPConnector:
             RuntimeError: The request has ended or the operation was replaced.
             Exception: RPC failure; the caller must finish the request.
         """
-        if self._lookups.get(operation.request_id) is not operation:
+        if not self._sync_success(self._lookups.get(operation.request_id) is operation):
             raise RuntimeError("Cannot poll a retired CacheBlend lookup")
         if operation.blend_result is not None:
             return operation.blend_result
-        future = operation.submission_future
-        if future is None:
-            aligned_end = len(operation.token_ids) // self.chunk_size * self.chunk_size
-            key = self._create_key(
-                operation,
-                start=0,
-                end=aligned_end,
-                worker_id=None,
-                request_configs={
-                    "lmcache.hint.engine_computed_tokens": operation.local_hit_tokens
-                },
+        result = None
+        error = None
+        if self.is_lookup_leader:
+            try:
+                future = operation.submission_future
+                if future is None:
+                    aligned_end = (
+                        len(operation.token_ids) // self.chunk_size * self.chunk_size
+                    )
+                    key = self._create_key(
+                        operation,
+                        start=0,
+                        end=aligned_end,
+                        worker_id=None,
+                        request_configs={
+                            "lmcache.hint.engine_computed_tokens": (
+                                operation.local_hit_tokens
+                            )
+                        },
+                    )
+                    operation.submission_future = self._req_client.cb_unified_lookup(
+                        key, self.tp_size
+                    )
+                elif future.query():
+                    result = future.result(timeout=0)
+                    operation.submission_future = None
+            except Exception as exc:
+                logger.exception("CacheBlend lookup polling failed")
+                error = exc
+        self._raise_blend_error(error)
+        results = [result]
+        if self.tp_size > 1:
+            dist.broadcast_object_list(
+                results,
+                src=dist.get_global_rank(self.tp_group, 0),
+                group=self.tp_group,
             )
-            operation.submission_future = self._req_client.cb_unified_lookup(key, 1)
-            return None
-        if not future.query():
-            return None
-        result = future.result(timeout=0)
-        operation.submission_future = None
+        result = results[0]
         if result is not None:
             operation.blend_result = result
             operation.total_hit_tokens = result.prefix_coverage_tokens
@@ -786,7 +835,7 @@ class UnifiedLMCacheMPConnector:
 
         Raises:
             ValueError: Invalid table geometry or device.
-            NotImplementedError: Unsupported layout or transfer context.
+            NotImplementedError: Multi-rank geometry, layout or transfer context.
             RuntimeError: KV registration is absent, protocol is incompatible,
                 or the server lacks rotary component support.
             TimeoutError: Registration, protocol, or capability query times out.
@@ -795,6 +844,8 @@ class UnifiedLMCacheMPConnector:
         Models with distinct per-layer rotary tables need separate registration
         metadata and are not represented by this shared-table API.
         """
+        if self.kv_world_size != 1:
+            raise NotImplementedError("CacheBlend transfers require a single rank")
         self._ensure_blend_protocol()
         transfer_ctx = self._transfer_ctx
         if transfer_ctx is None:
@@ -863,9 +914,12 @@ class UnifiedLMCacheMPConnector:
             RuntimeError: Retired/incomplete lookup, missing RoPE registration,
                 or a server without the required chunked-retrieve protocol.
             ValueError: Foreign/duplicate matches or insufficient/invalid pages.
-            NotImplementedError: The transfer context does not support blending.
+            NotImplementedError: Multi-rank geometry or a transfer context
+                that does not support blending.
             TimeoutError: Chunked protocol or capability query exceeds RPC timeout.
         """
+        if self.kv_world_size != 1:
+            raise NotImplementedError("CacheBlend transfers require a single rank")
         if self._lookups.get(operation.request_id) is not operation:
             raise RuntimeError("Cannot retrieve a retired CacheBlend lookup")
         result = operation.blend_result
@@ -1662,31 +1716,49 @@ class UnifiedLMCacheMPConnector:
         return completion
 
     def _ensure_blend_protocol(self, required_version: int = 1) -> None:
-        if (
-            self.kv_world_size != 1
-            or self.mla_enabled
-            or any(
-                group.recurrent_state
-                or group.sliding_window_size >= 0
-                or group.rope_num_layers is None
+        supported = (
+            self.pp_size == 1
+            and not self.mla_enabled
+            and all(
+                not group.recurrent_state
+                and group.sliding_window_size < 0
+                and group.rope_num_layers is not None
                 for group in self._kv_groups
             )
-        ):
-            raise NotImplementedError("CacheBlend requires single-rank full MHA")
-        if self._blend_protocol_version < required_version:
-            version, compatible = self._req_client.cb_protocol_handshake(
-                required_version
-            ).result(timeout=self._mq_timeout)
-            if version < required_version or not compatible:
-                raise RuntimeError(
-                    f"SGLang CacheBlend requires server protocol v{required_version}"
-                )
-            features = self._req_client.get_experimental().result(
-                timeout=self._mq_timeout
+        )
+        if not self._sync_success(supported):
+            raise NotImplementedError(
+                "CacheBlend requires full MHA without pipeline parallelism"
             )
-            if BLEND_ROTARY_COMPONENTS not in features:
-                raise RuntimeError(
-                    "SGLang CacheBlend requires the server capability "
-                    f"{BLEND_ROTARY_COMPONENTS}"
-                )
+        if self._blend_protocol_version < required_version:
+            error = None
+            if self.is_lookup_leader:
+                try:
+                    version, compatible = self._req_client.cb_protocol_handshake(
+                        required_version
+                    ).result(timeout=self._mq_timeout)
+                    if version < required_version or not compatible:
+                        raise RuntimeError(
+                            "SGLang CacheBlend requires server protocol "
+                            f"v{required_version}"
+                        )
+                    features = self._req_client.get_experimental().result(
+                        timeout=self._mq_timeout
+                    )
+                    if BLEND_ROTARY_COMPONENTS not in features:
+                        raise RuntimeError(
+                            "SGLang CacheBlend requires the server capability "
+                            f"{BLEND_ROTARY_COMPONENTS}"
+                        )
+                except Exception as exc:
+                    logger.exception("CacheBlend protocol negotiation failed")
+                    error = exc
+            self._raise_blend_error(error)
             self._blend_protocol_version = required_version
+
+    def _raise_blend_error(self, error: Exception | None) -> None:
+        """Raise a local RPC error, or report its failure to peer TP ranks."""
+        if not self._sync_success(error is None):
+            if error is not None:
+                raise error
+            raise RuntimeError("CacheBlend RPC failed on another TP rank")

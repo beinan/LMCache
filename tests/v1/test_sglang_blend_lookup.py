@@ -2,13 +2,18 @@
 """Request-owned CacheBlend lookup contracts, with CPU tensors and fake RPCs."""
 
 # Standard
+from datetime import timedelta
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
+import tempfile
 import threading
 import unittest
 
 # Third Party
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 # First Party
 from lmcache.integration.sglang.lmcache_mp_metadata import (
@@ -617,8 +622,145 @@ class TestSGLangBlendLookup(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "register_blend_rope"):
             self.connector.submit_blend_retrieve(lookup, torch.arange(16))
 
+    def test_tp_lookup_agreement_and_leader_owned_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            mp.spawn(
+                self.run_tp_lookup,
+                args=(Path(directory, "rendezvous").as_uri(),),
+                nprocs=2,
+                join=True,
+            )
+
+    @staticmethod
+    def run_tp_lookup(rank: int, rendezvous: str) -> None:
+        """Exercise public connector calls over a real two-process Gloo group."""
+        dist.init_process_group(
+            "gloo",
+            init_method=rendezvous,
+            rank=rank,
+            world_size=2,
+            timeout=timedelta(seconds=30),
+        )
+        case = TestSGLangBlendLookup()
+        case.setUp()
+        connector = case._make_connector(
+            [
+                SGLangKVComponentGroup(
+                    "full",
+                    tuple(torch.empty(32, 2, 8) for _ in range(2)),
+                    rope_num_layers=1,
+                )
+            ],
+            tp_size=2,
+            tp_rank=rank,
+            tp_group=dist.group.WORLD,
+        )
+        try:
+            case.client.cb_protocol_handshake.return_value.result.return_value = (
+                1,
+                False,
+            )
+            with case.assertRaises(RuntimeError):
+                connector.submit_blend_lookup(
+                    "bad-protocol", list(range(32)), local_hit_tokens=0, cache_salt=""
+                )
+            case.client.cb_unified_lookup.assert_not_called()
+            case.client.cb_protocol_handshake.return_value.result.return_value = (
+                1,
+                True,
+            )
+            operation = connector.submit_blend_lookup(
+                "mixed", list(range(32)), local_hit_tokens=0, cache_salt="tenant"
+            )
+            sessions: list[str | None] = [None, None]
+            dist.all_gather_object(sessions, operation.session_id)
+            case.assertEqual(sessions[0], sessions[1])
+            case.assertIsNone(connector.poll_blend_lookup(operation))
+            result = CBUnifiedLookupResult(
+                8,
+                [CBMatchResult(0, 8, 24, 32, b"shifted")],
+                [CBMatchResult(16, 24, 16, 24, b"exact")],
+            )
+            case.future.set_result(None)
+            case.assertIsNone(connector.poll_blend_lookup(operation))
+            complete: MessagingFuture[CBUnifiedLookupResult | None] = MessagingFuture()
+            complete.set_result(result)
+            case.client.cb_unified_lookup.return_value = complete
+            case.assertIsNone(connector.poll_blend_lookup(operation))
+            case.assertEqual(connector.poll_blend_lookup(operation), result)
+            case.assertEqual(connector.poll_lookup(operation), 8)
+            case.assertEqual(connector.get_store_start("mixed", 32), 8)
+            with case.assertRaisesRegex(NotImplementedError, "single rank"):
+                connector.register_blend_rope(None, is_neox_style=False)
+            with case.assertRaisesRegex(NotImplementedError, "single rank"):
+                connector.submit_blend_retrieve(operation, torch.arange(4, 36))
+            case.transfer.register_blend_rope.assert_not_called()
+            case.transfer.submit_blend_retrieve.assert_not_called()
+            connector.free_lookup_locks("mixed", 0, 8)
+            connector.finish_request("mixed")
+            if rank == 0:
+                case.assertEqual(case.client.cb_unified_lookup.call_count, 2)
+                key, peers = case.client.free_lookup_locks.call_args.args
+                case.assertEqual(
+                    (key.request_id, key.world_size, peers),
+                    (operation.session_id, 2, 2),
+                )
+                case.client.end_session.assert_called_once_with(operation.session_id)
+
+            # A cancelled lookup can reply after the same engine ID is reused.
+            late: MessagingFuture[CBUnifiedLookupResult | None] = MessagingFuture()
+            case.client.cb_unified_lookup.return_value = late
+            old = connector.submit_blend_lookup(
+                "reused", list(range(32)), local_hit_tokens=0, cache_salt=""
+            )
+            connector.finish_request("reused")
+            case.client.cb_unified_lookup.return_value = complete
+            new = connector.submit_blend_lookup(
+                "reused", list(range(32)), local_hit_tokens=0, cache_salt=""
+            )
+            case.assertNotEqual(old.session_id, new.session_id)
+            late.set_result(result)
+            case.assertEqual(connector.poll_blend_lookup(new), result)
+            connector.finish_request("reused")
+            if rank == 0:
+                case.assertEqual(
+                    [call.args[0] for call in case.client.end_session.call_args_list],
+                    [operation.session_id, old.session_id, new.session_id],
+                )
+
+            failed: MessagingFuture[CBUnifiedLookupResult | None] = MessagingFuture()
+            failed.set_exception(ConnectionError("lookup failed"))
+            case.client.cb_unified_lookup.return_value = failed
+            operation = connector.submit_blend_lookup(
+                "failed", list(range(32)), local_hit_tokens=0, cache_salt=""
+            )
+            with case.assertRaises((ConnectionError, RuntimeError)):
+                connector.poll_blend_lookup(operation)
+            connector.finish_request("failed")
+            case.client.cb_unified_lookup.side_effect = ConnectionError("submit failed")
+            with case.assertRaises((ConnectionError, RuntimeError)):
+                connector.submit_blend_lookup(
+                    "failed-submit", list(range(32)), local_hit_tokens=0, cache_salt=""
+                )
+            connector.finish_request("failed-submit")
+            if rank == 0:
+                case.assertEqual(case.client.end_session.call_count, 5)
+            else:
+                case.client.cb_protocol_handshake.assert_not_called()
+                case.client.cb_unified_lookup.assert_not_called()
+                case.client.free_lookup_locks.assert_not_called()
+                case.client.end_session.assert_not_called()
+        finally:
+            case.doCleanups()
+            dist.destroy_process_group()
+
     def _make_connector(
-        self, groups: list[SGLangKVComponentGroup]
+        self,
+        groups: list[SGLangKVComponentGroup],
+        *,
+        tp_size: int = 1,
+        tp_rank: int = 0,
+        tp_group: dist.ProcessGroup | None = None,
     ) -> UnifiedLMCacheMPConnector:
         adapter = Mock()
         adapter.resolve_registered_groups.return_value = groups
@@ -646,9 +788,9 @@ class TestSGLangBlendLookup(unittest.TestCase):
             connector = UnifiedLMCacheMPConnector(
                 config_file=None,
                 model_config=SimpleNamespace(model_path="test-model"),
-                tp_size=1,
-                tp_rank=0,
-                tp_group=None,
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+                tp_group=tp_group,
                 page_size=4,
                 token_to_kv_pool_allocator=object(),
                 req_to_token_pool=object(),
